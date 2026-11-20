@@ -1,0 +1,44 @@
+[package]
+name = "tarkov-helper"
+version = "0.1.0"
+edition = "2024"
+description = "Карта ценного лута Лаборатории для Escape from Tarkov"
+repository = "https://github.com/bobisdacool1/TarkovHelper"
+
+[dependencies]
+anyhow = "1.0.104"
+cargo-packager-updater = "0.2.3"
+dirs = "7.0.0"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+unicode-segmentation = "1.13.3"
+ureq = "2"
+
+# GPUI без оптимизаций очень медленный: зависимости оптимизируем даже в dev,
+# свой код остаётся быстро собираемым.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Упаковка: cargo packager --release (см. README / .github/workflows/release.yml)
+[package.metadata.packager]
+product-name = "Tarkov Helper"
+identifier = "io.github.bobisdacool1.tarkovhelper"
+category = "Utility"
+copyright = "bobisdacool1"
+before-packaging-command = "cargo build --release"
+icons = ["assets/icon.png"]
+out-dir = "dist"
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"

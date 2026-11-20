@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Зоны Лабы</title>
+<style>
+  :root { --bg:#111; --panel:#1c1b19; --card:#262420; --gold:#c2ab74; --gold-dim:#6f6248; --text:#ebe3cf; --muted:#7d7666; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px -apple-system, system-ui, sans-serif; }
+  #app { display:flex; height:100%; }
+  aside { width:340px; flex:none; background:var(--panel); border-right:1px solid var(--gold-dim); padding:16px; overflow-y:auto; }
+  h1 { color:var(--gold); font-size:18px; margin:0 0 4px; letter-spacing:.5px; }
+  h2 { color:var(--gold); font-size:12px; font-weight:500; letter-spacing:1px; margin:20px 0 8px; text-transform:uppercase; }
+  .hint { color:var(--muted); font-size:12px; line-height:1.5; }
+  .hint b { color:var(--text); font-weight:500; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; }
+  button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--gold-dim); padding:6px 10px; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--gold); }
+  button.on { background:var(--gold); color:#1a1a1a; border-color:var(--gold); }
+  button.primary { background:var(--gold); color:#1a1a1a; border-color:var(--gold); font-weight:600; }
+  button.danger:hover { border-color:#e05555; color:#ff8a8a; }
+  input, select { width:100%; }
+  label { display:block; color:var(--muted); font-size:12px; margin:10px 0 4px; }
+  .room { display:flex; align-items:center; gap:8px; padding:6px; cursor:pointer; border:1px solid transparent; }
+  .room:hover { background:var(--card); }
+  .room.sel { border-color:var(--gold); background:var(--card); }
+  .sw { width:12px; height:12px; flex:none; border:1px solid #999; }
+  .room .n { flex:1; }
+  .room .f { color:var(--muted); font-size:12px; }
+  #status { margin-top:10px; font-size:12px; color:var(--muted); min-height:16px; }
+  main { flex:1; position:relative; overflow:hidden; }
+  canvas { position:absolute; inset:0; cursor:crosshair; }
+  #tip { position:absolute; left:12px; bottom:12px; background:rgba(28,27,25,.92); border:1px solid var(--gold-dim); padding:6px 10px; font-size:12px; color:var(--muted); pointer-events:none; }
+  #tip b { color:var(--text); }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <h1>ЗОНЫ ЛАБЫ</h1>
+    <div class="hint">Сохранение пишет прямо в <b>assets/labs_rooms.json</b>. В приложении потом нажми «перечитать зоны».</div>
+
+    <h2>Этаж</h2>
+    <div class="row" id="floors"></div>
+
+    <h2>Как обводить</h2>
+    <div class="hint">
+      <b>Клик</b> — поставить точку. <b>Клик по первой точке</b>, <b>Enter</b> или <b>двойной клик</b> — замкнуть.<br>
+      <b>Backspace</b> — убрать последнюю точку, <b>Esc</b> — отменить.<br>
+      <b>Колесо / тачпад</b> — зум, <b>пробел + перетаскивание</b> или <b>правая кнопка</b> — двигать.<br>
+      <b>Shift</b> — линия строго по горизонтали/вертикали.<br>
+      Клик по готовой зоне (когда не рисуешь) — выбрать. Точки выбранной зоны можно таскать.
+    </div>
+
+    <div id="editor" style="display:none">
+      <h2>Зона</h2>
+      <label>Название</label>
+      <input id="f-name" placeholder="Красная">
+      <label>Чем открывается</label>
+      <select id="f-key"></select>
+      <label><input type="checkbox" id="f-approx" style="width:auto"> граница примерная</label>
+      <label><input type="checkbox" id="f-solid" style="width:auto"> комнаты нет на подложке (рисовать полом)</label>
+      <div class="row" style="margin-top:10px">
+        <button class="danger" id="f-del">Удалить зону</button>
+        <button id="f-close">Готово</button>
+      </div>
+    </div>
+
+    <h2>Зоны · <span id="count">0</span></h2>
+    <div id="rooms"></div>
+
+    <div class="row" style="margin-top:16px">
+      <button class="primary" id="save">Сохранить</button>
+      <button id="reload">Отменить изменения</button>
+    </div>
+    <div id="status"></div>
+  </aside>
+  <main>
+    <canvas id="cv"></canvas>
+    <div id="tip"></div>
+  </main>
+</div>
+<script>
+const FLOOR_NAMES = ["Технический", "1 этаж", "2 этаж"];
+const KEY_COLORS = {
+  "5c1d0efb86f7744baf2e7b7b": "#e53935", "5c1d0dc586f7744baf2e7b79": "#43a047", "5c1d0c5f86f7744bb2683cf0": "#1e88e5",
+  "5c1e495a86f7743109743dfb": "#8e24aa", "5c1d0d6d86f7744bb2683e1f": "#fdd835", "5c1d0f4986f7744bb01837fa": "#212121",
+  "5efde6b4f5448336730dbd61": "#4fc3f7", "6711039f9e648049e50b3307": "#ffffff",
+};
+const keyColor = k => KEY_COLORS[k] || "#9e9e9e";
+
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const tip = document.getElementById("tip");
+let meta, rooms = [], images = [], floor = 2;
+let view = { s: 0.25, ox: 0, oy: 0 };
+let drawing = [];           // точки в пикселях подложки
+let selected = -1, dragVertex = -1, panning = null, space = false, mouse = null, dirty = false;
+
+// ---- проекция: игровые (x, z) <-> пиксели склеенной подложки ----
+const FULL = () => 256 * (1 << meta.range.zoom);
+function toPx(x, z) {
+  const u = (0.575 * z + 281.2) / 175, v = (0.575 * x + 193.7) / 175;
+  return [u * FULL() - meta.range.tx0 * 256, v * FULL() - meta.range.ty0 * 256];
+}
+function toGame(px, py) {
+  const u = (px + meta.range.tx0 * 256) / FULL(), v = (py + meta.range.ty0 * 256) / FULL();
+  return [+((v * 175 - 193.7) / 0.575).toFixed(2), +((u * 175 - 281.2) / 0.575).toFixed(2)];
+}
+const scr = ([px, py]) => [view.ox + px * view.s, view.oy + py * view.s];
+const world = (sx, sy) => [(sx - view.ox) / view.s, (sy - view.oy) / view.s];
+
+function resize() {
+  const r = cv.parentElement.getBoundingClientRect(), d = devicePixelRatio || 1;
+  cv.width = r.width * d; cv.height = r.height * d;
+  cv.style.width = r.width + "px"; cv.style.height = r.height + "px";
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  draw();
+}
+function fit() {
+  const r = cv.getBoundingClientRect(), w = meta.range.w * 256, h = meta.range.h * 256;
+  view.s = Math.min(r.width / w, r.height / h) * 0.95;
+  view.ox = (r.width - w * view.s) / 2; view.oy = (r.height - h * view.s) / 2;
+}
+
+function polyPath(pts) {
+  ctx.beginPath();
+  pts.forEach((p, i) => { const [x, y] = scr(p); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+}
+
+function draw() {
+  if (!meta) return;
+  const r = cv.getBoundingClientRect();
+  ctx.fillStyle = "#111"; ctx.fillRect(0, 0, r.width, r.height);
+  const img = images[floor];
+  if (img && img.complete) {
+    ctx.imageSmoothingEnabled = view.s < 1;
+    ctx.drawImage(img, view.ox, view.oy, img.width * view.s, img.height * view.s);
+  }
+  // лут и двери для ориентира
+  ctx.fillStyle = "rgba(120,255,120,.75)";
+  for (const p of meta.loot) if (p.floor === floor) {
+    const [x, y] = scr(toPx(p.x, p.z)); ctx.beginPath(); ctx.arc(x, y, 2.5, 0, 7); ctx.fill();
+  }
+  ctx.font = "bold 11px -apple-system, system-ui";
+  for (const l of meta.locks) if (l.floor === floor) {
+    const [x, y] = scr(toPx(l.x, l.z));
+    ctx.fillStyle = keyColor(l.key); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.fillRect(x - 6, y - 6, 12, 12); ctx.strokeRect(x - 6, y - 6, 12, 12);
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 3;
+    ctx.strokeText(l.name, x + 9, y + 4); ctx.fillText(l.name, x + 9, y + 4);
+  }
+  // зоны
+  rooms.forEach((room, i) => {
+    if (room.floor !== floor || room.poly.length < 3) return;
+    const pts = room.poly.map(([x, z]) => toPx(x, z));
+    const c = keyColor(room.key);
+    polyPath(pts); ctx.closePath();
+    ctx.globalAlpha = i === selected ? 0.35 : 0.2; ctx.fillStyle = c; ctx.fill();
+    ctx.globalAlpha = 1; ctx.lineWidth = i === selected ? 3 : 2; ctx.strokeStyle = c === "#212121" ? "#aaa" : c; ctx.stroke();
+    const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length, cy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    const [sx, sy] = scr([cx, cy]);
+    ctx.font = "12px -apple-system, system-ui"; ctx.textAlign = "center";
+    ctx.lineWidth = 3; ctx.strokeStyle = "#000"; ctx.strokeText(room.name, sx, sy);
+    ctx.fillStyle = "#fff"; ctx.fillText(room.name, sx, sy); ctx.textAlign = "left";
+    if (i === selected) pts.forEach(p => { const [x, y] = scr(p); ctx.fillStyle = "#fff"; ctx.fillRect(x - 4, y - 4, 8, 8); ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.strokeRect(x - 4, y - 4, 8, 8); });
+  });
+  // текущий контур
+  if (drawing.length) {
+    const pts = mouse ? [...drawing, snap(world(...mouse))] : drawing;
+    polyPath(pts);
+    ctx.strokeStyle = "#ffeb3b"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.stroke(); ctx.setLineDash([]);
+    drawing.forEach((p, i) => {
+      const [x, y] = scr(p);
+      ctx.fillStyle = i === 0 ? "#ffeb3b" : "#fff";
+      ctx.beginPath(); ctx.arc(x, y, i === 0 ? 6 : 4, 0, 7); ctx.fill();
+      ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.stroke();
+    });
+  }
+  if (mouse) {
+    const [gx, gz] = toGame(...world(...mouse));
+    tip.innerHTML = `${FLOOR_NAMES[floor]} · x <b>${gx}</b> z <b>${gz}</b>` + (drawing.length ? ` · точек: <b>${drawing.length}</b>` : "");
+  }
+}
+
+function snap(p) {
+  if (!shift || !drawing.length) return p;
+  const last = drawing[drawing.length - 1];
+  return Math.abs(p[0] - last[0]) > Math.abs(p[1] - last[1]) ? [p[0], last[1]] : [last[0], p[1]];
+}
+let shift = false;
+
+// Почти горизонтальные/вертикальные рёбра (до 12°) выравниваем ровно, дубль первой точки убираем.
+function orthogonalize(src) {
+  const pts = src.map(p => [...p]);
+  if (pts.length > 3) {
+    const a = pts[0], b = pts[pts.length - 1];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) * view.s < 10) pts.pop();
+  }
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const ang = Math.abs(Math.atan2(b[1] - a[1], b[0] - a[0])) * 180 / Math.PI;
+    if (Math.min(ang, 180 - ang) < 12) { const m = (a[1] + b[1]) / 2; a[1] = m; b[1] = m; }
+    else if (Math.abs(ang - 90) < 12) { const m = (a[0] + b[0]) / 2; a[0] = m; b[0] = m; }
+  }
+  return pts;
+}
+
+// То же в игровых координатах — для готовых зон (после правки вершин и при сохранении).
+function snapGame(poly) {
+  const pts = poly.map(p => [...p]);
+  if (pts.length > 3 && Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]) < 0.5) pts.pop();
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const ang = Math.abs(Math.atan2(b[1] - a[1], b[0] - a[0])) * 180 / Math.PI;
+    if (Math.min(ang, 180 - ang) < 12) { const m = +((a[1] + b[1]) / 2).toFixed(2); a[1] = m; b[1] = m; }
+    else if (Math.abs(ang - 90) < 12) { const m = +((a[0] + b[0]) / 2).toFixed(2); a[0] = m; b[0] = m; }
+  }
+  return pts;
+}
+
+function finish() {
+  if (drawing.length < 3) { drawing = []; draw(); return; }
+  drawing = orthogonalize(drawing);
+  rooms.push({ name: "Новая зона", key: meta.locks.find(l => l.floor === floor)?.key || Object.keys(meta.keys)[0], floor, poly: drawing.map(p => toGame(...p)), approx: false });
+  drawing = []; selected = rooms.length - 1; dirty = true;
+  renderList(); showEditor(); draw();
+  document.getElementById("f-name").select();
+}
+
+function hitRoom(px, py) {
+  const [gx, gz] = toGame(px, py);
+  for (let i = rooms.length - 1; i >= 0; i--) {
+    const r = rooms[i]; if (r.floor !== floor) continue;
+    let inside = false;
+    for (let a = 0, b = r.poly.length - 1; a < r.poly.length; b = a++) {
+      const [xa, za] = r.poly[a], [xb, zb] = r.poly[b];
+      if ((za > gz) !== (zb > gz) && gx < (xb - xa) * (gz - za) / (zb - za) + xa) inside = !inside;
+    }
+    if (inside) return i;
+  }
+  return -1;
+}
+function hitVertex(sx, sy) {
+  if (selected < 0) return -1;
+  const pts = rooms[selected].poly.map(([x, z]) => scr(toPx(x, z)));
+  return pts.findIndex(([x, y]) => Math.hypot(x - sx, y - sy) < 8);
+}
+
+cv.addEventListener("contextmenu", e => e.preventDefault());
+cv.addEventListener("mousedown", e => {
+  const sx = e.offsetX, sy = e.offsetY;
+  if (e.button === 2 || e.button === 1 || space) { panning = { x: sx, y: sy, ox: view.ox, oy: view.oy }; return; }
+  if (!drawing.length) {
+    const v = hitVertex(sx, sy);
+    if (v >= 0) { dragVertex = v; return; }
+  }
+  const p = snap(world(sx, sy));
+  if (drawing.length >= 3) {
+    const [fx, fy] = scr(drawing[0]);
+    if (Math.hypot(fx - sx, fy - sy) < 10) { finish(); return; }
+  }
+  if (!drawing.length) {
+    const hit = hitRoom(...world(sx, sy));
+    if (hit >= 0 && !e.altKey) { select(hit); return; }
+    select(-1);
+  }
+  drawing.push(p); draw();
+});
+cv.addEventListener("dblclick", e => { if (drawing.length) { drawing.pop(); finish(); } });
+window.addEventListener("mousemove", e => {
+  const r = cv.getBoundingClientRect();
+  mouse = [e.clientX - r.left, e.clientY - r.top];
+  if (panning) { view.ox = panning.ox + mouse[0] - panning.x; view.oy = panning.oy + mouse[1] - panning.y; }
+  if (dragVertex >= 0) { rooms[selected].poly[dragVertex] = toGame(...world(...mouse)); dirty = true; }
+  draw();
+});
+window.addEventListener("mouseup", () => {
+  if (dragVertex >= 0 && selected >= 0) { rooms[selected].poly = snapGame(rooms[selected].poly); draw(); }
+  panning = null; dragVertex = -1;
+});
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const f = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025));
+  const ns = Math.min(8, Math.max(0.05, view.s * f)), k = ns / view.s;
+  view.ox = e.offsetX - (e.offsetX - view.ox) * k; view.oy = e.offsetY - (e.offsetY - view.oy) * k; view.s = ns;
+  draw();
+}, { passive: false });
+window.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") { if (e.key === "Enter") e.target.blur(); return; }
+  if (e.key === " ") { space = true; cv.style.cursor = "grab"; e.preventDefault(); }
+  if (e.key === "Shift") shift = true;
+  if (e.key === "Enter" && drawing.length) finish();
+  if (e.key === "Escape") { drawing = []; select(-1); }
+  if (e.key === "Backspace" && drawing.length) { drawing.pop(); e.preventDefault(); }
+  if ((e.key === "Delete" || e.key === "Backspace") && !drawing.length && selected >= 0) { removeSelected(); e.preventDefault(); }
+  if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); }
+  draw();
+});
+window.addEventListener("keyup", e => { if (e.key === " ") { space = false; cv.style.cursor = "crosshair"; } if (e.key === "Shift") shift = false; });
+window.addEventListener("beforeunload", e => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---- панель ----
+function renderFloors() {
+  const el = document.getElementById("floors"); el.innerHTML = "";
+  FLOOR_NAMES.forEach((n, i) => {
+    const b = document.createElement("button"); b.textContent = n; b.className = i === floor ? "on" : "";
+    b.onclick = () => { floor = i; drawing = []; select(-1); renderFloors(); draw(); };
+    el.appendChild(b);
+  });
+}
+function renderList() {
+  const el = document.getElementById("rooms"); el.innerHTML = "";
+  document.getElementById("count").textContent = rooms.length;
+  rooms.map((r, i) => [r, i]).sort((a, b) => a[0].floor - b[0].floor || a[0].name.localeCompare(b[0].name)).forEach(([r, i]) => {
+    const d = document.createElement("div"); d.className = "room" + (i === selected ? " sel" : "");
+    d.innerHTML = `<span class="sw" style="background:${keyColor(r.key)}"></span><span class="n"></span><span class="f">${FLOOR_NAMES[r.floor]}</span>`;
+    d.querySelector(".n").textContent = r.name + (r.approx ? " ≈" : "");
+    d.onclick = () => { floor = r.floor; renderFloors(); select(i); centerOn(r); };
+    el.appendChild(d);
+  });
+}
+function centerOn(r) {
+  const pts = r.poly.map(([x, z]) => toPx(x, z)), rr = cv.getBoundingClientRect();
+  const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length, cy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+  view.s = Math.max(view.s, 0.8); view.ox = rr.width / 2 - cx * view.s; view.oy = rr.height / 2 - cy * view.s; draw();
+}
+function select(i) { selected = i; renderList(); showEditor(); draw(); }
+function showEditor() {
+  const ed = document.getElementById("editor");
+  if (selected < 0) { ed.style.display = "none"; return; }
+  ed.style.display = ""; const r = rooms[selected];
+  document.getElementById("f-name").value = r.name;
+  document.getElementById("f-key").value = r.key;
+  document.getElementById("f-approx").checked = !!r.approx;
+  document.getElementById("f-solid").checked = !!r.solid;
+}
+function removeSelected() { rooms.splice(selected, 1); dirty = true; select(-1); }
+document.getElementById("f-name").oninput = e => { rooms[selected].name = e.target.value; dirty = true; renderList(); draw(); };
+document.getElementById("f-key").onchange = e => { rooms[selected].key = e.target.value; dirty = true; renderList(); draw(); };
+document.getElementById("f-approx").onchange = e => { rooms[selected].approx = e.target.checked; dirty = true; renderList(); };
+document.getElementById("f-solid").onchange = e => { rooms[selected].solid = e.target.checked; dirty = true; };
+document.getElementById("f-del").onclick = removeSelected;
+document.getElementById("f-close").onclick = () => select(-1);
+document.getElementById("save").onclick = save;
+document.getElementById("reload").onclick = async () => { await loadRooms(); status("Изменения отменены"); };
+
+function status(t) { document.getElementById("status").textContent = t; }
+async function save() {
+  // файл могли поменять вне редактора — не затираем молча
+  const current = await (await fetch("/api/rooms")).text();
+  if (loadedText !== null && current !== loadedText && !confirm("Файл зон изменился вне редактора (например, его поправил Claude). Перезаписать своей версией?\n\nОтмена — оставить файл, потом нажми «Отменить изменения», чтобы подтянуть его.")) {
+    status("Не сохранено: файл изменился снаружи"); return;
+  }
+  rooms.forEach(r => r.poly = snapGame(r.poly));
+  const out = rooms.map(r => ({ name: r.name, key: r.key, floor: r.floor, poly: r.poly, ...(r.approx ? { approx: true } : {}), ...(r.solid ? { solid: true } : {}) }));
+  const res = await fetch("/api/rooms", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(out) });
+  if (res.ok) { dirty = false; loadedText = await (await fetch("/api/rooms")).text(); draw(); status(`Сохранено ${out.length} зон · ${new Date().toLocaleTimeString()}`); }
+  else status("Ошибка сохранения: " + res.status);
+}
+let loadedText = null;
+async function loadRooms() {
+  loadedText = await (await fetch("/api/rooms")).text();
+  const raw = JSON.parse(loadedText);
+  rooms = raw.map(r => ({ ...r, poly: r.poly && r.poly.length >= 3 ? r.poly : [[r.x[0], r.z[0]], [r.x[1], r.z[0]], [r.x[1], r.z[1]], [r.x[0], r.z[1]]] }));
+  dirty = false; selected = -1; renderList(); showEditor(); draw();
+}
+
+(async function init() {
+  meta = await (await fetch("/api/meta")).json();
+  const sel = document.getElementById("f-key");
+  Object.entries(meta.keys).sort((a, b) => a[1].localeCompare(b[1])).forEach(([id, name]) => {
+    const o = document.createElement("option"); o.value = id; o.textContent = name; sel.appendChild(o);
+  });
+  images = meta.images.map(f => { const im = new Image(); im.onload = draw; im.src = "/maps/" + f; return im; });
+  renderFloors(); resize(); fit(); await loadRooms();
+})();
+window.addEventListener("resize", resize);
+// вернулся во вкладку и своих правок нет — подтягиваем свежий файл
+window.addEventListener("focus", async () => {
+  if (dirty || drawing.length || !meta) return;
+  const current = await (await fetch("/api/rooms")).text();
+  if (current !== loadedText) { await loadRooms(); status("Подтянул изменения файла"); }
+});
+</script>
+</body>
+</html>

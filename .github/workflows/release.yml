@@ -1,0 +1,123 @@
+name: Release
+
+# Пуш тега vX.Y.Z → сборки под macOS (Apple Silicon, Intel) и Windows,
+# подписанные пакеты обновления и latest.json для встроенного обновлятора.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+            formats: app,dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+            formats: app,dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            formats: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          P="${{ matrix.platform }}"
+          mkdir -p upload
+          shopt -s nullglob
+          if [[ "$P" == macos-* ]]; then
+            for f in dist/*.dmg;            do cp "$f" "upload/TarkovHelper_${VERSION}_${P}.dmg"; done
+            for f in dist/*.app.tar.gz;     do cp "$f" "upload/TarkovHelper_${VERSION}_${P}.app.tar.gz"; done
+            for f in dist/*.app.tar.gz.sig; do cp "$f" "upload/TarkovHelper_${VERSION}_${P}.app.tar.gz.sig"; done
+          else
+            for f in dist/*-setup.exe;      do cp "$f" "upload/TarkovHelper_${VERSION}_${P}-setup.exe"; done
+            for f in dist/*-setup.exe.sig;  do cp "$f" "upload/TarkovHelper_${VERSION}_${P}-setup.exe.sig"; done
+          fi
+          ls -la upload
+          test -n "$(ls upload)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: upload/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: upload
+          merge-multiple: true
+
+      - name: Write latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          python3 - "$VERSION" "$BASE" <<'PY'
+          import json, os, sys, datetime
+          version, base = sys.argv[1], sys.argv[2]
+          platforms = {}
+          for name in sorted(os.listdir("upload")):
+              if not name.endswith(".sig"):
+                  continue
+              bundle = name[: -len(".sig")]
+              # TarkovHelper_<version>_<platform>...; в platform есть "_" (x86_64)
+              platform = bundle.split("_", 2)[2].replace(".app.tar.gz", "").replace("-setup.exe", "")
+              platforms[platform] = {
+                  "signature": open(os.path.join("upload", name)).read().strip(),
+                  "url": f"{base}/{bundle}",
+                  "format": "nsis" if bundle.endswith(".exe") else "app",
+              }
+          manifest = {
+              "version": version,
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "notes": f"Tarkov Helper {version}",
+              "platforms": platforms,
+          }
+          json.dump(manifest, open("upload/latest.json", "w"), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
