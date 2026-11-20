@@ -46,6 +46,18 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Check signing secrets
+        shell: bash
+        env:
+          K: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          P: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # только длины и короткие хэши — сами секреты не светим
+          ks=$(printf %s "$K" | shasum -a 256 | cut -c1-12)
+          ps=$(printf %s "$P" | shasum -a 256 | cut -c1-12)
+          echo "::notice title=signing secrets::key ${#K} chars, starts $(printf %s "$K" | head -c 12), sha $ks; password ${#P} chars, sha $ps"
+          if [ -z "$K" ]; then echo "::error::CARGO_PACKAGER_SIGN_PRIVATE_KEY пустой"; exit 1; fi
+
       - name: Package
         shell: bash
         env:
