@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::app::{checkbox, segmented, tier_color, Check, CARD, GOLD, GOLD_DIM, MUTED, PANEL, TEXT};
-use crate::data::{fmt_rub, fmt_short, Item, LabData};
+use crate::data::{fmt_rub, fmt_short, Item, MapData};
 use crate::maps::MAPS;
 use crate::raids::{self, Raid, RaidItem};
 
@@ -62,7 +62,7 @@ pub struct RaidOverlay {
 }
 
 /// Пример: рюкзак со скриншота пользователя (распознан прототипом).
-pub fn sample_backpack(data: &LabData) -> Vec<Detected> {
+pub fn sample_backpack(data: &MapData) -> Vec<Detected> {
     let found = [
         ("635a758bfefc88a93f021b8a", 1),
         ("59faf7ca86f7740dbe19f6c2", 1),

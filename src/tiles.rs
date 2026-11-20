@@ -1,11 +1,118 @@
-//! Склейка тайлов tarkov.dev в одну картинку на этаж (кэшируется на диске).
+//! Подложка карты: склейка тайлов tarkov.dev в одну картинку на этаж (Лаба)
+//! или растр SVG-карты (Маяк). Картинки кэшируются на диске.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use image::{ImageFormat, RgbaImage};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::data::{data_dir, http_get, LabData};
-use crate::labs::{self, Room, FLOORS, TILE_ZOOM};
+use crate::data::{data_dir, http_get, MapData};
+use crate::labs::{self, Room, FLOOR_DIRS, TILE_ZOOM};
+use crate::maps::{self, SvgMap};
+
+/// Проекция игровых координат на картинку этажа (одинакова для всех этажей карты).
+#[derive(Clone, Copy, Debug)]
+pub enum Geo {
+    Tiles(TileRange),
+    Svg(SvgMap),
+}
+
+impl Geo {
+    pub fn pixel_size(&self) -> (f32, f32) {
+        match self {
+            Geo::Tiles(r) => r.pixel_size(),
+            Geo::Svg(m) => {
+                let (w, h) = m.image_size();
+                (w as f32, h as f32)
+            }
+        }
+    }
+
+    /// Игровые (x, z) → пиксели картинки этажа.
+    pub fn project(&self, x: f64, z: f64) -> (f32, f32) {
+        match self {
+            Geo::Tiles(r) => r.project(x, z),
+            Geo::Svg(m) => {
+                let (lx, ly) = m.leaflet(x, z);
+                let (l, t, r, b) = m.leaflet_rect();
+                let (w, h) = m.image_size();
+                (((lx - l) / (r - l) * w as f64) as f32, ((ly - t) / (b - t) * h as f64) as f32)
+            }
+        }
+    }
+
+    /// Пиксели картинки этажа → игровые (x, z).
+    pub fn unproject(&self, px: f32, py: f32) -> (f64, f64) {
+        match self {
+            Geo::Tiles(r) => r.unproject(px, py),
+            Geo::Svg(m) => {
+                let (l, t, r, b) = m.leaflet_rect();
+                let (w, h) = m.image_size();
+                m.game(l + px as f64 / w as f64 * (r - l), t + py as f64 / h as f64 * (b - t))
+            }
+        }
+    }
+}
+
+/// Готовит подложку карты: проекцию и картинки этажей (скачивает и кэширует недостающее).
+pub fn prepare(data: &MapData) -> Result<(Geo, Vec<PathBuf>)> {
+    if let Some(svg) = maps::svg_map(data.map) {
+        let img = svg_image(data.map, svg)?;
+        return Ok((Geo::Svg(svg), vec![img]));
+    }
+    let range = TileRange::for_data(data);
+    ensure_floors(range)?;
+    let images = (0..FLOOR_DIRS.len())
+        .map(|f| floor_image(range, f, &data.rooms))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Geo::Tiles(range), images))
+}
+
+/// Растр SVG-карты. SVG качается один раз; картинка — по хэшу SVG и размеру.
+fn svg_image(map: &str, svg: SvgMap) -> Result<PathBuf> {
+    use resvg::{tiny_skia, usvg};
+    use std::hash::{Hash, Hasher};
+    let dir = data_dir().join("maps");
+    std::fs::create_dir_all(&dir)?;
+    let src = dir.join(format!("{map}.svg"));
+    if !src.exists() {
+        let bytes = http_get(svg.url).with_context(|| format!("скачать {}", svg.url))?;
+        write_atomic(&src, &bytes)?;
+    }
+    let bytes = std::fs::read(&src)?;
+    let (w, h) = svg.image_size();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let path = dir.join(format!("{map}_{w}x{h}_{:x}.png", hasher.finish()));
+    if path.exists() {
+        return Ok(path);
+    }
+    let tree = usvg::Tree::from_data(&bytes, &usvg::Options::default()).context("разобрать SVG карты")?;
+    let size = tree.size();
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).context("картинка карты слишком большая")?;
+    // bounds карты — это ровно весь холст SVG
+    let tf = tiny_skia::Transform::from_scale(w as f32 / size.width(), h as f32 / size.height());
+    resvg::render(&tree, tf, &mut pixmap.as_mut());
+    let rgba: Vec<u8> = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    let img = RgbaImage::from_raw(w, h, rgba).context("растр карты")?;
+    let tmp = path.with_extension("png.tmp");
+    img.save_with_format(&tmp, ImageFormat::Png)?;
+    std::fs::rename(tmp, &path)?;
+    Ok(path)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
 
 /// Какой кусок сетки тайлов склеен в картинки (одинаково для всех этажей).
 #[derive(Clone, Copy, Debug)]
@@ -18,7 +125,7 @@ pub struct TileRange {
 
 impl TileRange {
     /// Охватывает все точки лута и двери с запасом.
-    pub fn for_data(data: &LabData) -> Self {
+    pub fn for_data(data: &MapData) -> Self {
         let n = (1u32 << TILE_ZOOM) as f64;
         let (mut u0, mut u1, mut v0, mut v1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
         let positions = data.loot.iter().map(|l| l.pos).chain(data.locks.iter().map(|l| l.pos));
@@ -59,20 +166,20 @@ impl TileRange {
     pub fn floor_path(&self, floor: usize) -> PathBuf {
         data_dir().join("maps").join(format!(
             "labs_{}_z{}_{}_{}_{}x{}.png",
-            FLOORS[floor].tile_dir, TILE_ZOOM, self.tx0, self.ty0, self.w, self.h
+            FLOOR_DIRS[floor], TILE_ZOOM, self.tx0, self.ty0, self.w, self.h
         ))
     }
 }
 
 /// Скачивает и склеивает недостающие этажи.
-pub fn ensure_floors(range: TileRange) -> Result<()> {
+fn ensure_floors(range: TileRange) -> Result<()> {
     std::fs::create_dir_all(data_dir().join("maps"))?;
-    for floor in 0..FLOORS.len() {
+    for floor in 0..FLOOR_DIRS.len() {
         let path = range.floor_path(floor);
         if path.exists() {
             continue;
         }
-        let img = stitch(range, FLOORS[floor].tile_dir)?;
+        let img = stitch(range, FLOOR_DIRS[floor])?;
         let tmp = path.with_extension("png.tmp");
         img.save_with_format(&tmp, ImageFormat::Png)?;
         std::fs::rename(tmp, path)?;
@@ -121,7 +228,7 @@ fn stitch(range: TileRange, dir: &str) -> Result<RgbaImage> {
 
 /// Картинка этажа с дорисованными комнатами, которых нет на подложке tarkov.dev
 /// (`solid` в labs_rooms.json). Кэшируется по хэшу таких комнат.
-pub fn floor_image(range: TileRange, floor: usize, rooms: &[Room]) -> Result<PathBuf> {
+fn floor_image(range: TileRange, floor: usize, rooms: &[Room]) -> Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let base = range.floor_path(floor);
     let solid: Vec<&Room> = rooms.iter().filter(|r| r.solid && r.floor == floor).collect();

@@ -29,6 +29,7 @@ impl gpui::AssetSource for Assets {
             "icons/exit.svg" => include_bytes!("../assets/icons/exit.svg"),
             "icons/transit.svg" => include_bytes!("../assets/icons/transit.svg"),
             "icons/stairs.svg" => include_bytes!("../assets/icons/stairs.svg"),
+            "icons/spawn.svg" => include_bytes!("../assets/icons/spawn.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))

@@ -5511,6 +5511,7 @@ dependencies = [
  "image",
  "objc",
  "raw-window-handle",
+ "resvg",
  "semver",
  "serde",
  "serde_json",

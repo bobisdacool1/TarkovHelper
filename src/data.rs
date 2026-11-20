@@ -146,6 +146,19 @@ struct RawMap {
     extracts: Vec<RawExtract>,
     #[serde(default)]
     transits: Vec<RawTransit>,
+    #[serde(default)]
+    spawns: Vec<RawSpawn>,
+}
+
+#[derive(Deserialize)]
+struct RawSpawn {
+    position: Pos,
+    /// all / pmc / scav
+    #[serde(default)]
+    sides: Vec<String>,
+    /// player / bot / boss / botpmc
+    #[serde(default)]
+    categories: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -215,7 +228,7 @@ pub struct LootPoint {
     pub pos: Pos,
     pub floor: usize,
     pub items: Vec<String>,
-    /// Индекс комнаты в `LabData::rooms`, если точка за запертой дверью.
+    /// Индекс комнаты в `MapData::rooms`, если точка за запертой дверью.
     pub room: Option<usize>,
 }
 
@@ -235,6 +248,13 @@ pub struct Extract {
     pub floor: usize,
 }
 
+/// Точка появления ЧВК-игрока.
+#[derive(Clone, Debug)]
+pub struct Spawn {
+    pub pos: Pos,
+    pub floor: usize,
+}
+
 /// Зачем предмет нужен: уровень убежища или задача.
 #[derive(Clone, Debug)]
 pub struct Need {
@@ -244,19 +264,23 @@ pub struct Need {
     pub found_in_raid: bool,
 }
 
-pub struct LabData {
+pub struct MapData {
+    /// id карты (`maps::LAB`, `maps::LIGHTHOUSE`).
+    pub map: &'static str,
     pub mode: Mode,
     pub fetched_at: Option<u64>,
     pub items: HashMap<String, Item>,
     pub loot: Vec<LootPoint>,
     pub locks: Vec<Lock>,
     pub extracts: Vec<Extract>,
+    /// Где может появиться ЧВК.
+    pub spawns: Vec<Spawn>,
     pub rooms: Vec<Room>,
     /// item id -> где нужен.
     pub needs: HashMap<String, Vec<Need>>,
 }
 
-impl LabData {
+impl MapData {
     /// Короткое имя, как говорят игроки: LEDX, GPU, 0.2BTC.
     pub fn item_short(&self, id: &str) -> String {
         self.items.get(id).map(|i| i.short.clone()).unwrap_or_else(|| id.to_string())
@@ -283,8 +307,8 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Читает кэш режима и собирает данные Лабы.
-pub fn load_lab(mode: Mode) -> Result<LabData> {
+/// Читает кэш режима и собирает данные карты.
+pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
     let dir = data_dir().join(mode.dir());
     let items: Envelope<ItemsData> = read_json(&dir.join("items.json"))?;
     let ru: Envelope<HashMap<String, String>> = read_json(&dir.join("items_ru.json"))?;
@@ -336,15 +360,17 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
         .data
         .maps
         .into_values()
-        .find(|m| m.normalized_name == labs::MAP_ID)
-        .context("в дампе нет карты the-lab")?;
+        .find(|m| m.normalized_name == map)
+        .with_context(|| format!("в дампе нет карты {map}"))?;
 
-    let rooms = labs::rooms();
+    // зоны за дверями размечены только на Лабе
+    let rooms = if map == crate::maps::LAB { labs::rooms() } else { Vec::new() };
+    let floor_of = |p: Pos| crate::maps::floor_of(map, p);
     let loot = lab
         .loot_loose
         .into_iter()
         .map(|l| {
-            let floor = labs::floor_of(l.position);
+            let floor = floor_of(l.position);
             let room = rooms.iter().position(|r| r.contains(l.position, floor));
             LootPoint { pos: l.position, floor, items: l.items, room }
         })
@@ -352,7 +378,7 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
     let locks = lab
         .locks
         .into_iter()
-        .filter_map(|l| Some(Lock { floor: labs::floor_of(l.position), pos: l.position, key: l.key? }))
+        .filter_map(|l| Some(Lock { floor: floor_of(l.position), pos: l.position, key: l.key? }))
         .collect();
 
     let maps_ru: HashMap<String, String> = read_json::<Envelope<HashMap<String, String>>>(&dir.join("maps_ru.json"))
@@ -364,20 +390,31 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
         .map(|e| Extract {
             name: maps_ru.get(&e.name).cloned().unwrap_or(e.name),
             faction: e.faction,
-            floor: labs::floor_of(e.position),
+            floor: floor_of(e.position),
             pos: e.position,
         })
         .collect();
     extracts.extend(lab.transits.into_iter().map(|t| Extract {
         name: "Переход".into(),
         faction: "transit".into(),
-        floor: labs::floor_of(t.position),
+        floor: floor_of(t.position),
         pos: t.position,
     }));
 
+    // спавны ЧВК: игроки стороны all/pmc (у ботов и Диких — свои точки)
+    let spawns = lab
+        .spawns
+        .into_iter()
+        .filter(|s| {
+            s.categories.iter().any(|c| c.eq_ignore_ascii_case("player"))
+                && s.sides.iter().any(|v| v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("pmc"))
+        })
+        .map(|s| Spawn { floor: floor_of(s.position), pos: s.position })
+        .collect();
+
     let needs = load_needs(&dir);
 
-    Ok(LabData { mode, fetched_at, items, loot, locks, extracts, rooms, needs })
+    Ok(MapData { map, mode, fetched_at, items, loot, locks, extracts, spawns, rooms, needs })
 }
 
 pub fn normalize(s: &str) -> String {

@@ -1,4 +1,4 @@
-//! Главное окно: меню в стиле mapgenie слева и карта Лабы (три этажа рядом).
+//! Главное окно: меню в стиле mapgenie слева и карта (у Лабы — три этажа рядом).
 
 use gpui::{
     canvas, div, img, point, prelude::*, svg, Hsla, PathBuilder, px, rgb, rgba, AnyElement, App, Bounds, ClickEvent, Context,
@@ -10,11 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::categories::GROUPS;
-use crate::data::{self, fmt_rub, fmt_short, Item, LabData, Mode};
-use crate::labs::{key_color, point_in_poly, FLOORS};
+use crate::data::{self, fmt_rub, fmt_short, Item, MapData, Mode};
+use crate::labs::{key_color, point_in_poly};
 use crate::settings;
 use crate::text_input::{InputChanged, TextInput};
-use crate::tiles::{self, TileRange};
+use crate::tiles::{self, Geo};
 
 const SIDEBAR_W: f32 = 400.0;
 const PAD: f32 = 16.0;
@@ -32,6 +32,8 @@ pub(crate) const GOLD: u32 = 0xc2ab74;
 pub(crate) const GOLD_DIM: u32 = 0x6f6248;
 pub(crate) const TEXT: u32 = 0xebe3cf;
 pub(crate) const MUTED: u32 = 0x7d7666;
+/// Маркер спавна ЧВК: салатовый — не путается с картами доступа, выходами и ценами лута.
+const SPAWN: u32 = 0xd4e157;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -97,8 +99,11 @@ enum Status {
 pub struct HelperApp {
     mode: Mode,
     status: Status,
-    data: Option<Rc<LabData>>,
-    range: Option<TileRange>,
+    /// Выбранная карта (id из `maps::MAPS`).
+    map: &'static str,
+    data: Option<Rc<MapData>>,
+    /// Проекция координат на картинки этажей.
+    geo: Option<Geo>,
     /// Картинки этажей (с дорисованными комнатами).
     floor_images: Vec<std::path::PathBuf>,
     threshold: i64,
@@ -116,6 +121,7 @@ pub struct HelperApp {
     show_doors: bool,
     show_rooms: bool,
     show_extracts: bool,
+    show_spawns: bool,
     /// Автообновление цен: при старте, если данные старше часа, и каждые 30 минут.
     auto_refresh: bool,
     /// Проверять обновления приложения при запуске.
@@ -233,8 +239,9 @@ impl HelperApp {
         let mut this = Self {
             mode: if st.mode == "pvp" { Mode::Pvp } else { Mode::Pve },
             status: Status::Idle,
+            map: crate::maps::get(&st.map).id,
             data: None,
-            range: None,
+            geo: None,
             floor_images: Vec::new(),
             threshold: st.threshold,
             search: String::new(),
@@ -248,10 +255,11 @@ impl HelperApp {
                 .collect(),
             expanded: st.expanded.iter().copied().collect(),
             collapsed: SECTIONS.iter().copied().filter(|k| st.collapsed.contains(*k)).collect(),
-            floor_view: st.floor_view,
+            floor_view: st.floor_view.filter(|f| *f < crate::maps::floor_titles(crate::maps::get(&st.map).id).len()),
             show_doors: st.show_doors,
             show_rooms: st.show_rooms,
             show_extracts: st.show_extracts,
+            show_spawns: st.show_spawns,
             auto_refresh: st.auto_refresh,
             auto_update_check: st.auto_update_check,
             section: match st.section.as_str() {
@@ -371,6 +379,7 @@ impl HelperApp {
             show_doors: self.show_doors,
             show_rooms: self.show_rooms,
             show_extracts: self.show_extracts,
+            show_spawns: self.show_spawns,
             auto_refresh: self.auto_refresh,
             auto_update_check: self.auto_update_check,
             section: match self.section {
@@ -380,7 +389,7 @@ impl HelperApp {
                 Section::Settings => "settings",
             }
             .into(),
-            map: "the-lab".into(),
+            map: self.map.into(),
             scanner: self.scanner.clone(),
         }
     }
@@ -397,6 +406,7 @@ impl HelperApp {
     /// Загружает данные режима (из кэша или скачивает дамп) и готовит подложку.
     fn load(&mut self, force_download: bool, cx: &mut Context<Self>) {
         let mode = self.mode;
+        let map = self.map;
         let need_download = force_download || !data::has_dump(mode);
         self.status = Status::Busy(if need_download {
             format!("Скачиваю дамп {}…", mode.label())
@@ -413,19 +423,15 @@ impl HelperApp {
                         data::download_dump(mode)?;
                         crate::labs::refresh_rooms_from_repo();
                     }
-                    let lab = data::load_lab(mode)?;
-                    let range = TileRange::for_data(&lab);
-                    tiles::ensure_floors(range)?;
-                    let images = (0..FLOORS.len())
-                        .map(|f| tiles::floor_image(range, f, &lab.rooms))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    anyhow::Ok((lab, range, images))
+                    let lab = data::load_map(mode, map)?;
+                    let (geo, images) = tiles::prepare(&lab)?;
+                    anyhow::Ok((lab, geo, images))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 let mut refresh_after = false;
                 match result {
-                    Ok((lab, range, images)) if lab.mode == this.mode => {
+                    Ok((lab, geo, images)) if lab.mode == this.mode && lab.map == this.map => {
                         eprintln!(
                             "tarkov-helper: данные {} ({}) за {} мс",
                             mode.label(),
@@ -442,7 +448,7 @@ impl HelperApp {
                         // показали кэш, а свежие цены докачаем следом
                         refresh_after = !need_download && stale && this.auto_refresh;
                         this.data = Some(Rc::new(lab));
-                        this.range = Some(range);
+                        this.geo = Some(geo);
                         this.floor_images = images;
                         this.status = Status::Idle;
                         this.selected_point = None;
@@ -458,6 +464,27 @@ impl HelperApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Переключает карту: старая подложка убирается сразу, новая грузится в фоне.
+    fn set_map(&mut self, map: &'static str, cx: &mut Context<Self>) {
+        if self.map == map {
+            return;
+        }
+        self.map = map;
+        self.data = None;
+        self.geo = None;
+        self.floor_images.clear();
+        self.floor_view = None;
+        self.selected_point = None;
+        self.hover = None;
+        self.fitted = false;
+        self.load(false, cx);
+    }
+
+    /// Заголовки этажей текущей карты.
+    fn floors(&self) -> &'static [&'static str] {
+        crate::maps::floor_titles(self.map)
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -489,30 +516,36 @@ impl HelperApp {
             && !self.hidden_items.contains(&item.id)
     }
 
-    fn access_of(&self, d: &LabData, point: usize) -> Option<String> {
+    fn access_of(&self, d: &MapData, point: usize) -> Option<String> {
         d.loot[point].room.map(|r| d.rooms[r].key.clone())
     }
 
+    /// Точка скрыта фильтром «Доступ». Он есть только у карт с размеченными комнатами
+    /// (на Маяке «без ключа», скрытое на Лабе, не должно прятать весь лут).
+    fn access_hidden(&self, d: &MapData, point: usize) -> bool {
+        !d.rooms.is_empty() && self.hidden_access.contains(&self.access_of(d, point))
+    }
+
     /// Комната под курсором (локальные координаты карты).
-    fn room_at(&self, d: &LabData, local: (f32, f32)) -> Option<usize> {
-        let range = self.range?;
+    fn room_at(&self, d: &MapData, local: (f32, f32)) -> Option<usize> {
+        let geo = self.geo?;
         d.rooms.iter().position(|room| {
             if !self.floor_visible(room.floor) {
                 return false;
             }
             let wx = (local.0 - self.offset.0) / self.scale - self.floor_origin(room.floor);
             let wy = (local.1 - self.offset.1) / self.scale;
-            let (x, z) = range.unproject(wx, wy);
+            let (x, z) = geo.unproject(wx, wy);
             point_in_poly(&room.poly, x, z)
         })
     }
 
-    fn visible_points(&self, d: &LabData) -> Vec<Visible> {
+    fn visible_points(&self, d: &MapData) -> Vec<Visible> {
         d.loot
             .iter()
             .enumerate()
             .filter_map(|(idx, p)| {
-                if self.hidden_access.contains(&self.access_of(d, idx)) {
+                if self.access_hidden(d, idx) {
                     return None;
                 }
                 let mut items: Vec<String> = p
@@ -559,8 +592,8 @@ impl HelperApp {
     }
 
     fn world_size(&self) -> Option<(f32, f32)> {
-        let (w, h) = self.range?.pixel_size();
-        let n = if self.floor_view.is_some() { 1 } else { FLOORS.len() };
+        let (w, h) = self.geo?.pixel_size();
+        let n = if self.floor_view.is_some() { 1 } else { self.floors().len() };
         Some((w * n as f32 + FLOOR_GAP * (n - 1) as f32, h))
     }
 
@@ -568,7 +601,7 @@ impl HelperApp {
         if self.floor_view.is_some() {
             return 0.0;
         }
-        let (w, _) = self.range.map(|r| r.pixel_size()).unwrap_or((0.0, 0.0));
+        let (w, _) = self.geo.map(|g| g.pixel_size()).unwrap_or((0.0, 0.0));
         floor as f32 * (w + FLOOR_GAP)
     }
 
@@ -576,14 +609,14 @@ impl HelperApp {
     fn set_floor_view(&mut self, view: Option<usize>, cx: &mut Context<Self>) {
         self.hover = None;
         let bounds = *self.map_bounds.borrow();
-        let (Some(b), Some(range), true) = (bounds, self.range, self.fitted) else {
+        let (Some(b), Some(geo), true) = (bounds, self.geo, self.fitted) else {
             // карта ещё не показана — просто вписываем
             self.floor_view = view;
             self.fit();
             cx.notify();
             return;
         };
-        let (floor_w, _) = range.pixel_size();
+        let (floor_w, _) = geo.pixel_size();
         let center = (f32::from(b.size.width) / 2.0, f32::from(b.size.height) / 2.0);
         // точка карты под центром: этаж и координата внутри картинки этажа
         let world_x = (center.0 - self.offset.0) / self.scale;
@@ -592,7 +625,7 @@ impl HelperApp {
             Some(f) => (f, world_x),
             None => {
                 let step = floor_w + FLOOR_GAP;
-                let f = ((world_x / step).floor().max(0.0) as usize).min(FLOORS.len() - 1);
+                let f = ((world_x / step).floor().max(0.0) as usize).min(self.floors().len() - 1);
                 (f, world_x - f as f32 * step)
             }
         };
@@ -605,7 +638,7 @@ impl HelperApp {
     }
 
     fn to_screen(&self, floor: usize, x: f64, z: f64) -> (f32, f32) {
-        let (px_, py_) = self.range.unwrap().project(x, z);
+        let (px_, py_) = self.geo.unwrap().project(x, z);
         (
             self.offset.0 + (self.floor_origin(floor) + px_) * self.scale,
             self.offset.1 + py_ * self.scale,
@@ -640,7 +673,7 @@ impl HelperApp {
     }
 
     fn render_map(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.fitted && self.map_bounds.borrow().is_some() && self.range.is_some() {
+        if !self.fitted && self.map_bounds.borrow().is_some() && self.geo.is_some() {
             self.fit();
         }
         let bounds_cell = self.map_bounds.clone();
@@ -662,17 +695,19 @@ impl HelperApp {
             .into_any_element(),
         );
 
-        if let (Some(d), Some(range)) = (self.data.clone(), self.range) {
-            let (iw, ih) = range.pixel_size();
+        if let (Some(d), Some(geo)) = (self.data.clone(), self.geo) {
+            let (iw, ih) = geo.pixel_size();
             let s = self.scale;
-            for f in 0..FLOORS.len() {
+            let floors = self.floors();
+            for f in 0..floors.len() {
                 if !self.floor_visible(f) {
                     continue;
                 }
                 let x = self.offset.0 + self.floor_origin(f) * s;
                 let y = self.offset.1;
+                let Some(image) = self.floor_images.get(f).cloned() else { continue };
                 layers.push(
-                    img(self.floor_images.get(f).cloned().unwrap_or_else(|| range.floor_path(f)))
+                    img(image)
                         .absolute()
                         .left(px(x))
                         .top(px(y))
@@ -680,17 +715,19 @@ impl HelperApp {
                         .h(px(ih * s))
                         .into_any_element(),
                 );
-                layers.push(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y - 26.0))
-                        .text_color(rgb(GOLD))
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .child(FLOORS[f].title.to_uppercase())
-                        .into_any_element(),
-                );
+                if floors.len() > 1 {
+                    layers.push(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y - 26.0))
+                            .text_color(rgb(GOLD))
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child(floors[f].to_uppercase())
+                            .into_any_element(),
+                    );
+                }
             }
 
             if self.show_rooms {
@@ -814,6 +851,35 @@ impl HelperApp {
                 }
             }
 
+            if self.show_spawns {
+                for (si, sp) in d.spawns.iter().enumerate().filter(|(_, sp)| self.floor_visible(sp.floor)) {
+                    let (sx, sy) = self.to_screen(sp.floor, sp.pos.x, sp.pos.z);
+                    let lines = [String::from("Спавн ЧВК"), floors[sp.floor].to_string()]
+                        .into_iter()
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    layers.push(
+                        div()
+                            .id(ElementId::named_usize("spawn", si))
+                            .absolute()
+                            .left(px(sx - 9.0))
+                            .top(px(sy - 9.0))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(SPAWN))
+                            .border_1()
+                            .border_color(rgb(0x111111))
+                            .shadow_md()
+                            .child(svg().path("icons/spawn.svg").size(px(12.0)).text_color(rgb(0x111111)))
+                            .on_hover(Self::hover_listener(format!("spawn{si}"), lines, sp.floor, sp.pos.x, sp.pos.z, cx))
+                            .into_any_element(),
+                    );
+                }
+            }
+
             if self.show_extracts {
                 for (ei, ex) in d.extracts.iter().enumerate().filter(|(_, e)| self.floor_visible(e.floor)) {
                     let (sx, sy) = self.to_screen(ex.floor, ex.pos.x, ex.pos.z);
@@ -845,7 +911,7 @@ impl HelperApp {
                             })
                             .on_hover(Self::hover_listener(
                                 format!("exit{ei}"),
-                                vec![kind.to_string(), ex.name.clone(), FLOORS[ex.floor].title.to_string()],
+                                [kind, ex.name.as_str(), floors[ex.floor]].iter().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect(),
                                 ex.floor,
                                 ex.pos.x,
                                 ex.pos.z,
@@ -949,10 +1015,10 @@ impl HelperApp {
             }
         }
 
-        // переключатель этажей
+        // переключатель этажей (только у многоэтажных карт)
         let views: [(Option<usize>, &'static str); 4] =
             [(None, "Все этажи"), (Some(0), "Подвал"), (Some(1), "1 этаж"), (Some(2), "2 этаж")];
-        layers.push(
+        layers.extend((self.floors().len() > 1).then(||
             div()
                 .absolute()
                 .top(px(10.0))
@@ -972,7 +1038,7 @@ impl HelperApp {
                     )
                 }))
                 .into_any_element(),
-        );
+        ));
 
         // кнопки зума
         layers.push(
@@ -1077,7 +1143,7 @@ impl HelperApp {
     }
 
     /// Карточка выбранной точки рядом с маркером.
-    fn render_popup(&self, d: &LabData, pi: usize, x: f32, y: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_popup(&self, d: &MapData, pi: usize, x: f32, y: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = &d.loot[pi];
         let mut items: Vec<&Item> = p.items.iter().filter_map(|id| d.items.get(id)).collect();
         items.sort_by_key(|i| -i.price());
@@ -1110,7 +1176,10 @@ impl HelperApp {
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(GOLD))
-                            .child(FLOORS[p.floor].title.to_uppercase()),
+                            .child(match self.floors()[p.floor] {
+                                "" => crate::maps::name(self.map).to_uppercase(),
+                                t => t.to_uppercase(),
+                            }),
                     )
                     .child(
                         div()
@@ -1317,7 +1386,7 @@ impl HelperApp {
                             this.map_menu_open = !this.map_menu_open;
                             cx.notify();
                         }))
-                        .child("ЛАБОРАТОРИЯ")
+                        .child(crate::maps::name(self.map).to_uppercase())
                         .child(div().text_sm().child(if self.map_menu_open { "▴" } else { "▾" })),
                 )
                 .child(segmented("mode-pve", "PvE", self.mode == Mode::Pve, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pve, cx))))
@@ -1448,7 +1517,8 @@ impl HelperApp {
                 .then(a.0.cmp(&b.0))
         });
         let all_access: Vec<Option<String>> = access.iter().map(|(k, _)| k.clone()).collect();
-        col = col.child(section_with_links(
+        let has_rooms = !d.rooms.is_empty();
+        col = col.when(has_rooms, |col| col.child(section_with_links(
             "sec-access",
             "Доступ",
             open_access,
@@ -1461,8 +1531,8 @@ impl HelperApp {
                 this.hidden_access.extend(all_access.iter().cloned());
                 cx.notify();
             })),
-        ));
-        for (i, (key, (n, sum))) in access.into_iter().enumerate().filter(|_| open_access) {
+        )));
+        for (i, (key, (n, sum))) in access.into_iter().enumerate().filter(|_| open_access && has_rooms) {
             let on = !self.hidden_access.contains(&key);
             let (name, color, key_price) = match &key {
                 None => ("Без ключа".to_string(), None, None),
@@ -1530,7 +1600,7 @@ impl HelperApp {
         // точки на предмет (с учётом фильтра доступа)
         let mut per_item: HashMap<&str, usize> = HashMap::new();
         for (pi, p) in d.loot.iter().enumerate() {
-            if self.hidden_access.contains(&self.access_of(&d, pi)) {
+            if self.access_hidden(&d, pi) {
                 continue;
             }
             let mut seen = HashSet::new();
@@ -1686,7 +1756,11 @@ impl HelperApp {
             "Локации",
             open_loc,
             Self::toggle_section("loc", cx),
-            link("rooms-reload", "перечитать зоны", cx.listener(|this, _, _, cx| this.load(false, cx))),
+            if has_rooms {
+                link("rooms-reload", "перечитать зоны", cx.listener(|this, _, _, cx| this.load(false, cx))).into_any_element()
+            } else {
+                div().into_any_element()
+            },
             div(),
         ));
         col = col.when(open_loc, |col| col.child(
@@ -1698,12 +1772,16 @@ impl HelperApp {
                     this.show_doors = !this.show_doors;
                     cx.notify();
                 })))
-                .child(Self::category_cell("l-rooms".into(), "🚪", "Комнаты", d.rooms.len(), self.show_rooms, cx.listener(|this, _, _, cx| {
+                .when(has_rooms, |el| el.child(Self::category_cell("l-rooms".into(), "🚪", "Комнаты", d.rooms.len(), self.show_rooms, cx.listener(|this, _, _, cx| {
                     this.show_rooms = !this.show_rooms;
                     cx.notify();
-                })))
+                }))))
                 .child(Self::category_cell("l-exits".into(), "🏃", "Выходы", d.extracts.len(), self.show_extracts, cx.listener(|this, _, _, cx| {
                     this.show_extracts = !this.show_extracts;
+                    cx.notify();
+                })))
+                .child(Self::category_cell("l-spawns".into(), "👤", "Спавны ЧВК", d.spawns.len(), self.show_spawns, cx.listener(|this, _, _, cx| {
+                    this.show_spawns = !this.show_spawns;
                     cx.notify();
                 }))),
         ));
@@ -1712,7 +1790,7 @@ impl HelperApp {
 }
 
 /// Все варианты доступа, кроме `keep` — для кнопки «только».
-fn all_access_clone(data: &Option<Rc<LabData>>, keep: &Option<String>) -> HashSet<Option<String>> {
+fn all_access_clone(data: &Option<Rc<MapData>>, keep: &Option<String>) -> HashSet<Option<String>> {
     let mut all: HashSet<Option<String>> = HashSet::new();
     all.insert(None);
     if let Some(d) = data {
@@ -1924,7 +2002,8 @@ impl HelperApp {
             .border_color(rgb(GOLD_DIM))
             .bg(rgb(CARD))
             .children(crate::maps::MAPS.iter().enumerate().map(|(i, m)| {
-                let current = m.id == "the-lab";
+                let current = m.id == self.map;
+                let id = m.id;
                 div()
                     .id(ElementId::named_usize("map-opt", i))
                     .flex()
@@ -1935,8 +2014,9 @@ impl HelperApp {
                     .text_color(rgb(if m.available { TEXT } else { MUTED }))
                     .when(current, |el| el.bg(rgb(0x302c24)))
                     .when(m.available, |el| {
-                        el.cursor_pointer().hover(|s| s.bg(rgb(0x302c24))).on_click(cx.listener(|this, _, _, cx| {
+                        el.cursor_pointer().hover(|s| s.bg(rgb(0x302c24))).on_click(cx.listener(move |this, _, _, cx| {
                             this.map_menu_open = false;
+                            this.set_map(id, cx);
                             cx.notify();
                         }))
                     })
@@ -2391,9 +2471,7 @@ impl HelperApp {
         let raids = self.raid_log.read(cx).raids.clone();
         let mode = self.raids_mode;
         let stats = crate::raids::stats(&raids, mode);
-        let map_name = |id: &str| {
-            crate::maps::MAPS.iter().find(|m| m.id == id).map(|m| m.name).unwrap_or("?").to_string()
-        };
+        let map_name = |id: &str| crate::maps::name(id).to_string();
         let heading = |t: &'static str| div().mt_6().mb_2().text_sm().text_color(rgb(GOLD)).child(t);
 
         // таблица по картам, по убыванию среднего профита

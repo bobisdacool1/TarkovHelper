@@ -21,6 +21,8 @@ pub struct Settings {
     pub show_doors: bool,
     pub show_rooms: bool,
     pub show_extracts: bool,
+    /// Точки появления ЧВК на карте.
+    pub show_spawns: bool,
     pub auto_refresh: bool,
     /// Проверять обновления приложения при запуске.
     pub auto_update_check: bool,
@@ -95,6 +97,7 @@ impl Default for Settings {
             floor_view: None,
             show_doors: true,
             show_rooms: true,
+            show_spawns: true,
             show_extracts: true,
             auto_refresh: true,
             auto_update_check: true,

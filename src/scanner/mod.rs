@@ -13,7 +13,7 @@ use std::rc::Rc;
 use gpui::{AppContext as _, Context, Entity};
 use image::{Rgba, RgbaImage};
 
-use crate::data::LabData;
+use crate::data::MapData;
 use crate::raid_overlay::RaidLog;
 use crate::settings::ScannerSettings;
 
@@ -261,7 +261,7 @@ fn dump_debug(dir: &std::path::Path, img: &RgbaImage, cursor: (u32, u32), out: &
 /// Состояние сканера в приложении: хуки, карточка поверх игры, последний результат.
 pub struct Scanner {
     pub settings: ScannerSettings,
-    data: Option<Rc<LabData>>,
+    data: Option<Rc<MapData>>,
     mode: String,
     log: Entity<RaidLog>,
     /// Пока записывается сочетание, хоткеи сканера молчат.
@@ -334,7 +334,7 @@ impl Scanner {
     }
 
     /// Свежие настройки, данные и режим из главного окна.
-    pub fn sync(&mut self, settings: &ScannerSettings, data: Option<Rc<LabData>>, mode: &str, recording: bool) {
+    pub fn sync(&mut self, settings: &ScannerSettings, data: Option<Rc<MapData>>, mode: &str, recording: bool) {
         self.data = data;
         if self.mode != mode {
             self.mode = mode.to_string();
@@ -652,7 +652,7 @@ mod tests {
         let img = image::load_from_memory(include_bytes!("../../tools/scanner-prototype/backpack.png")).unwrap().to_rgba8();
         let gray = image::imageops::grayscale(&img);
         let (boxes, lat) = vision::items_around(&gray, 300, 450, 84.0, None).unwrap();
-        let data = crate::data::load_lab(crate::data::Mode::Pve).ok();
+        let data = crate::data::load_map(crate::data::Mode::Pve, crate::maps::LAB).ok();
         let m = data.as_ref().map(|d| matcher::Matcher::new(&d.items));
         let mut known = Vec::new();
         for b in boxes.iter().filter(|b| b.x0 >= 200) {
@@ -725,7 +725,7 @@ mod tooltip_tests {
         };
         let tooltip = read(&tooltip_image(&img, tip));
         eprintln!("подсказка: {tooltip:?}");
-        let Ok(data) = crate::data::load_lab(crate::data::Mode::Pve) else {
+        let Ok(data) = crate::data::load_map(crate::data::Mode::Pve, crate::maps::LAB) else {
             eprintln!("пропуск сопоставления: нет кэша дампа PvE");
             return;
         };

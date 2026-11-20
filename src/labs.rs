@@ -3,22 +3,12 @@
 
 use serde::Deserialize;
 
-pub const MAP_ID: &str = "the-lab";
 pub const TILE_ROOT: &str = "https://assets.tarkov.dev/maps/labs_v4";
 /// Зум тайлов, из которых склеиваем подложку (256px * 2^Z на всю сетку).
 pub const TILE_ZOOM: u32 = 4;
 
-/// Этажи слева направо: подвал, первый, второй.
-pub const FLOORS: [Floor; 3] = [
-    Floor { tile_dir: "technical", title: "Технический этаж" },
-    Floor { tile_dir: "1st", title: "1 этаж" },
-    Floor { tile_dir: "2nd", title: "2 этаж" },
-];
-
-pub struct Floor {
-    pub tile_dir: &'static str,
-    pub title: &'static str,
-}
+/// Папки тайлов этажей слева направо: подвал, первый, второй (заголовки — `maps::floor_titles`).
+pub const FLOOR_DIRS: [&str; 3] = ["technical", "1st", "2nd"];
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct Pos {
