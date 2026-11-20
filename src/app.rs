@@ -2,7 +2,7 @@
 
 use gpui::{
     canvas, div, img, point, prelude::*, svg, Hsla, PathBuilder, px, rgb, rgba, AnyElement, App, Bounds, ClickEvent, Context,
-    ElementId, Entity, Focusable, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ElementId, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Window,
 };
 use std::cell::RefCell;
@@ -25,13 +25,20 @@ const SECTIONS: [&str; 4] = ["price", "access", "loot", "loc"];
 const THRESHOLDS: [i64; 7] = [0, 50_000, 100_000, 200_000, 300_000, 500_000, 1_000_000];
 
 // палитра в духе mapgenie: тёмная панель, золото, кремовый текст
-const BG: u32 = 0x111111;
-const PANEL: u32 = 0x1c1b19;
-const CARD: u32 = 0x262420;
-const GOLD: u32 = 0xc2ab74;
-const GOLD_DIM: u32 = 0x6f6248;
-const TEXT: u32 = 0xebe3cf;
-const MUTED: u32 = 0x7d7666;
+pub(crate) const BG: u32 = 0x111111;
+pub(crate) const PANEL: u32 = 0x1c1b19;
+pub(crate) const CARD: u32 = 0x262420;
+pub(crate) const GOLD: u32 = 0xc2ab74;
+pub(crate) const GOLD_DIM: u32 = 0x6f6248;
+pub(crate) const TEXT: u32 = 0xebe3cf;
+pub(crate) const MUTED: u32 = 0x7d7666;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Maps,
+    Scanner,
+    Raids,
+}
 
 enum UpdateState {
     None,
@@ -70,6 +77,22 @@ pub struct HelperApp {
     show_extracts: bool,
     /// Автообновление цен: при старте, если данные старше часа, и каждые 30 минут.
     auto_refresh: bool,
+    /// Открытый раздел приложения.
+    section: Section,
+    /// Открыт список выбора карты.
+    map_menu_open: bool,
+    scanner: settings::ScannerSettings,
+    /// Идёт запись сочетания: Some(true) — сканирование, Some(false) — скрытие.
+    recording: Option<bool>,
+    hotkey_focus: FocusHandle,
+    /// Журнал рейдов (общий с оверлеем после рейда).
+    raid_log: Entity<crate::raid_overlay::RaidLog>,
+    /// Фильтр статистики рейдов по режиму: None — все.
+    raids_mode: Option<&'static str>,
+    /// Раскрытый рейд в истории.
+    open_raid: Option<usize>,
+    /// Пример предмета в превью оверлея.
+    preview_item: usize,
     /// Обновление приложения.
     update: UpdateState,
     /// Последнее записанное на диск состояние настроек.
@@ -126,7 +149,7 @@ fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui:
     }
 }
 
-fn tier_color(price: i64) -> u32 {
+pub(crate) fn tier_color(price: i64) -> u32 {
     match price {
         p if p >= 1_000_000 => 0xff5252,
         p if p >= 500_000 => 0xffa726,
@@ -142,7 +165,7 @@ fn contrast(color: u32) -> u32 {
     if r * 299 + g * 587 + b * 114 > 150_000 { 0x111111 } else { 0xffffff }
 }
 
-fn with_alpha(color: u32, alpha: u32) -> gpui::Rgba {
+pub(crate) fn with_alpha(color: u32, alpha: u32) -> gpui::Rgba {
     rgba((color << 8) | alpha)
 }
 
@@ -156,6 +179,8 @@ impl HelperApp {
         })
         .detach();
         let st = settings::load();
+        let raid_log = cx.new(|_| crate::raid_overlay::RaidLog::load());
+        cx.observe(&raid_log, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
             mode: if st.mode == "pvp" { Mode::Pvp } else { Mode::Pve },
             status: Status::Idle,
@@ -179,6 +204,19 @@ impl HelperApp {
             show_rooms: st.show_rooms,
             show_extracts: st.show_extracts,
             auto_refresh: st.auto_refresh,
+            section: match st.section.as_str() {
+                "scanner" => Section::Scanner,
+                "raids" => Section::Raids,
+                _ => Section::Maps,
+            },
+            map_menu_open: false,
+            recording: None,
+            hotkey_focus: cx.focus_handle(),
+            preview_item: 0,
+            raid_log,
+            raids_mode: None,
+            open_raid: None,
+            scanner: st.scanner.clone(),
             saved: st,
             update: UpdateState::None,
             selected_point: None,
@@ -256,6 +294,14 @@ impl HelperApp {
             show_rooms: self.show_rooms,
             show_extracts: self.show_extracts,
             auto_refresh: self.auto_refresh,
+            section: match self.section {
+                Section::Maps => "maps",
+                Section::Scanner => "scanner",
+                Section::Raids => "raids",
+            }
+            .into(),
+            map: "the-lab".into(),
+            scanner: self.scanner.clone(),
         }
     }
 
@@ -1150,7 +1196,25 @@ impl HelperApp {
                 .pb_3()
                 .border_b_1()
                 .border_color(rgb(GOLD_DIM))
-                .child(div().flex_1().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child("ЛАБОРАТОРИЯ"))
+                .child(
+                    div()
+                        .id("map-picker")
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(GOLD))
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.map_menu_open = !this.map_menu_open;
+                            cx.notify();
+                        }))
+                        .child("ЛАБОРАТОРИЯ")
+                        .child(div().text_sm().child(if self.map_menu_open { "▴" } else { "▾" })),
+                )
                 .child(segmented("mode-pve", "PvE", self.mode == Mode::Pve, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pve, cx))))
                 .child(segmented("mode-pvp", "PvP", self.mode == Mode::Pvp, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pvp, cx))))
                 .child(segmented("auto", "авто", self.auto_refresh, cx.listener(|this, _, _, cx| {
@@ -1177,6 +1241,9 @@ impl HelperApp {
                         })),
                 ),
         );
+        if self.map_menu_open {
+            col = col.child(self.render_map_menu(cx));
+        }
         let status = match &self.status {
             Status::Busy(s) => div().text_color(rgb(GOLD)).child(s.clone()),
             Status::Error(e) => div().text_color(rgb(0xff6b6b)).child(format!("Ошибка: {e}")),
@@ -1553,13 +1620,13 @@ fn all_access_clone(data: &Option<Rc<LabData>>, keep: &Option<String>) -> HashSe
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Check {
+pub(crate) enum Check {
     On,
     Off,
     Partial,
 }
 
-fn checkbox(state: Check) -> impl IntoElement {
+pub(crate) fn checkbox(state: Check) -> impl IntoElement {
     div()
         .size(px(16.0))
         .flex_none()
@@ -1636,7 +1703,7 @@ fn map_button(
         .child(label)
 }
 
-fn segmented(
+pub(crate) fn segmented(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     active: bool,
@@ -1657,7 +1724,7 @@ fn segmented(
         .child(label.into())
 }
 
-fn link(
+pub(crate) fn link(
     id: &'static str,
     label: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -1679,7 +1746,754 @@ impl Render for HelperApp {
             .size_full()
             .bg(rgb(BG))
             .font_family(if cfg!(target_os = "windows") { "Segoe UI" } else { ".SystemUIFont" })
-            .child(self.render_sidebar(window, cx))
-            .child(self.render_map(cx))
+            .child(self.render_rail(cx))
+            .map(|root| match self.section {
+                Section::Maps => root.child(self.render_sidebar(window, cx)).child(self.render_map(cx)),
+                Section::Scanner => root.child(self.render_scanner(cx)),
+                Section::Raids => root.child(self.render_raids(cx)),
+            })
+    }
+}
+
+// ---------- разделы: навигация, выбор карты, сканер цен ----------
+
+
+impl HelperApp {
+    /// Узкая колонка слева с разделами.
+    fn render_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let item = |id: &'static str, icon: &'static str, label: &'static str, section: Section, active: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .py_3()
+                .cursor_pointer()
+                .border_l_2()
+                .border_color(rgb(if active { GOLD } else { 0x0e0e0e }))
+                .bg(rgb(if active { CARD } else { 0x0e0e0e }))
+                .hover(|s| s.bg(rgb(CARD)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.section = section;
+                    this.hover = None;
+                    cx.notify();
+                }))
+                .child(div().text_xl().child(icon))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(if active { GOLD } else { MUTED }))
+                        .child(label),
+                )
+        };
+        div()
+            .w(px(72.0))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .pt_2()
+            .bg(rgb(0x0e0e0e))
+            .border_r_1()
+            .border_color(rgb(GOLD_DIM))
+            .child(item("nav-maps", "🗺", "КАРТЫ", Section::Maps, self.section == Section::Maps, cx))
+            .child(item("nav-scanner", "🔍", "СКАНЕР", Section::Scanner, self.section == Section::Scanner, cx))
+            .child(item("nav-raids", "📊", "РЕЙДЫ", Section::Raids, self.section == Section::Raids, cx))
+    }
+
+    /// Выпадающий список карт под заголовком.
+    fn render_map_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .mt_2()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(GOLD_DIM))
+            .bg(rgb(CARD))
+            .children(crate::maps::MAPS.iter().enumerate().map(|(i, m)| {
+                let current = m.id == "the-lab";
+                div()
+                    .id(ElementId::named_usize("map-opt", i))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py(px(6.0))
+                    .text_color(rgb(if m.available { TEXT } else { MUTED }))
+                    .when(current, |el| el.bg(rgb(0x302c24)))
+                    .when(m.available, |el| {
+                        el.cursor_pointer().hover(|s| s.bg(rgb(0x302c24))).on_click(cx.listener(|this, _, _, cx| {
+                            this.map_menu_open = false;
+                            cx.notify();
+                        }))
+                    })
+                    .child(m.name)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if current { GOLD } else { MUTED }))
+                            .child(if current { "✓" } else if m.available { "" } else { "скоро" }),
+                    )
+            }))
+    }
+
+    /// Страница настроек сканера цен.
+    fn render_scanner(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sc = self.scanner.clone();
+        let supported = cfg!(target_os = "windows");
+
+        let toggle_row = |id: &'static str, label: &'static str, hint: &'static str, on: bool, f: fn(&mut settings::ScannerSettings), cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_3()
+                .py(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(CARD)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    f(&mut this.scanner);
+                    cx.notify();
+                }))
+                .child(checkbox(if on { Check::On } else { Check::Off }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_color(rgb(if on { TEXT } else { MUTED })).child(label))
+                        .when(!hint.is_empty(), |el| el.child(div().text_xs().text_color(rgb(MUTED)).child(hint))),
+                )
+        };
+        let heading = |t: &'static str| div().mt_6().mb_2().text_sm().text_color(rgb(GOLD)).child(t);
+
+        let status_card = div()
+            .mt_4()
+            .p_3()
+            .border_1()
+            .border_color(rgb(if supported { GOLD_DIM } else { 0x7a5a2a }))
+            .bg(rgb(CARD))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(if supported { GOLD } else { 0xffb74d }))
+                    .child(if supported { "Сканер в разработке" } else { "Сканер работает только на Windows" }),
+            )
+            .child(div().text_sm().text_color(rgb(MUTED)).child(if supported {
+                "Настройки уже сохраняются — сам сканер появится в одном из следующих обновлений."
+            } else {
+                "Игра запускается только на Windows, поэтому сканер будет там. Здесь можно заранее настроить, что он будет показывать."
+            }));
+
+        let seconds: [(u32, &'static str); 4] = [(3, "3 с"), (5, "5 с"), (10, "10 с"), (0, "пока не скрою")];
+        let positions: [(&'static str, &'static str); 2] = [("cursor", "у курсора"), ("corner", "в углу экрана")];
+
+        div()
+            .id("scanner-page")
+            .flex_1()
+            .flex()
+            .items_start()
+            .gap(px(32.0))
+            .h_full()
+            .overflow_y_scroll()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .w(px(640.0))
+                    .flex_none()
+                    .px(px(32.0))
+                    .py(px(24.0))
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child("СКАНЕР ЦЕН"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("Наведи курсор на предмет в игре и нажми клавишу — рядом появится его цена."),
+                    )
+                    .child(status_card)
+                    .child(heading("ОСНОВНОЕ"))
+                    .child(toggle_row("sc-enabled", "Включить сканер", "Сканер слушает горячую клавишу, пока открыт Tarkov Helper", sc.enabled, |s| s.enabled = !s.enabled, cx))
+                    .child(heading("ГОРЯЧИЕ КЛАВИШИ"))
+                    .child(self.hotkey_field("hk-scan", "Сканировать предмет под курсором", &sc.scan_key, true, cx))
+                    .child(self.hotkey_field("hk-hide", "Скрыть оверлей", &sc.hide_key, false, cx))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Нажми на поле и затем нужное сочетание: например Ctrl + Shift + F9 или Alt + Q. Esc — отмена."),
+                    )
+                    .child(heading("ЧТО ПОКАЗЫВАТЬ"))
+                    .child(toggle_row("sc-slot", "Цена за клетку", "Чтобы понять, стоит ли предмет места в рюкзаке", sc.show_per_slot, |s| s.show_per_slot = !s.show_per_slot, cx))
+                    .child(toggle_row("sc-flea", "Цена на барахолке", "lastLow — самый дешёвый лот", sc.show_flea, |s| s.show_flea = !s.show_flea, cx))
+                    .child(toggle_row("sc-trader", "Лучший торговец", "Кому выгоднее сдать и за сколько", sc.show_trader, |s| s.show_trader = !s.show_trader, cx))
+                    .child(toggle_row("sc-needed", "Нужен для убежища и задач", "", sc.show_needed, |s| s.show_needed = !s.show_needed, cx))
+                    .child(heading("ОВЕРЛЕЙ"))
+                    .child(toggle_row(
+                        "sc-hold",
+                        "Показывать, пока держу клавишу",
+                        "Отпустил клавишу сканирования — оверлей пропал",
+                        sc.hold_to_show,
+                        |s| s.hold_to_show = !s.hold_to_show,
+                        cx,
+                    ))
+                    .map(|el| {
+                        if sc.hold_to_show {
+                            el.child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("В режиме удержания таймер и скрытие при движении мыши не нужны."),
+                            )
+                        } else {
+                            el.child(toggle_row("sc-move", "Скрывать, когда двигаю мышь", "", sc.hide_on_mouse_move, |s| s.hide_on_mouse_move = !s.hide_on_mouse_move, cx))
+                                .child(div().text_sm().mt_2().mb_1().child("Сколько показывать"))
+                                .child(div().flex().flex_wrap().gap_1().children(seconds.into_iter().enumerate().map(|(i, (v, label))| {
+                                    segmented(
+                                        ElementId::named_usize("sc-sec", i),
+                                        label,
+                                        sc.show_seconds == v,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.scanner.show_seconds = v;
+                                            cx.notify();
+                                        }),
+                                    )
+                                })))
+                        }
+                    })
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Оверлей после рейда висит всегда — пока не подтвердишь или не отменишь."),
+                    )
+                    .child(div().text_sm().mt_3().mb_1().child("Где показывать"))
+                    .child(div().flex().flex_wrap().gap_1().children(positions.into_iter().enumerate().map(|(i, (v, label))| {
+                        segmented(
+                            ElementId::named_usize("sc-pos", i),
+                            label,
+                            sc.position == v,
+                            cx.listener(move |this, _, _, cx| {
+                                this.scanner.position = v.to_string();
+                                cx.notify();
+                            }),
+                        )
+                    })))
+                    .child(heading("КАК ЭТО РАБОТАЕТ"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("1. По клавише делается снимок окна игры.")
+                            .child("2. На снимке находятся квадраты предметов, и в правом верхнем углу каждого распознаётся короткое имя.")
+                            .child("3. Название сверяется со списком предметов, цена берётся из тех же данных, что и карта.")
+                            .child("Только снимок экрана — в память игры приложение не лезет. Игру нужно запускать в режиме «оконный без рамки»."),
+                    ),
+            )
+            .child(self.render_overlay_preview(cx))
+    }
+}
+
+impl HelperApp {
+    /// Поле горячей клавиши: клик — запись следующего сочетания.
+    fn hotkey_field(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        combo: &str,
+        is_scan: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let recording = self.recording == Some(is_scan);
+        let default = if is_scan { "f9" } else { "f10" };
+        let is_default = combo.eq_ignore_ascii_case(default);
+        let keycap = |k: String| {
+            div()
+                .px_2()
+                .py(px(2.0))
+                .border_1()
+                .border_b_2()
+                .border_color(rgb(GOLD_DIM))
+                .bg(rgb(0x2c2924))
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(TEXT))
+                .child(k)
+        };
+        let caps = crate::hotkey::display(combo);
+        let n = caps.len();
+
+        let field = div()
+            .id(id)
+            .w(px(300.0))
+            .h(px(40.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_1()
+            .border_1()
+            .border_color(rgb(if recording { GOLD } else { GOLD_DIM }))
+            .bg(rgb(if recording { 0x2c2924 } else { PANEL }))
+            .cursor_pointer()
+            .hover(|s| s.border_color(rgb(GOLD)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.recording = Some(is_scan);
+                this.hotkey_focus.focus(window);
+                cx.notify();
+            }))
+            .when(recording, |el| {
+                el.track_focus(&self.hotkey_focus)
+                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                        let k = &ev.keystroke;
+                        let plain = !(k.modifiers.control || k.modifiers.alt || k.modifiers.shift || k.modifiers.platform);
+                        if k.key == "escape" && plain {
+                            this.recording = None;
+                            window.blur();
+                        } else if let Some(new) = crate::hotkey::from_keystroke(k) {
+                            let sc = &mut this.scanner;
+                            let (mine, other) =
+                                if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
+                            if other.eq_ignore_ascii_case(&new) {
+                                *other = mine.clone();
+                            }
+                            *mine = new;
+                            this.recording = None;
+                            window.blur();
+                        } else {
+                            return; // только модификатор — ждём основную клавишу
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.recording = None;
+                        cx.notify();
+                    }))
+            })
+            .map(|el| {
+                if recording {
+                    el.child(div().text_sm().text_color(rgb(GOLD)).child("Нажми сочетание…"))
+                        .child(div().flex_1())
+                        .child(div().text_xs().text_color(rgb(MUTED)).child("Esc — отмена"))
+                } else {
+                    el.children(caps.into_iter().enumerate().flat_map(move |(i, k)| {
+                        let mut v: Vec<AnyElement> = vec![keycap(k).into_any_element()];
+                        if i + 1 < n {
+                            v.push(div().text_xs().text_color(rgb(MUTED)).child("+").into_any_element());
+                        }
+                        v
+                    }))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(rgb(MUTED)).child("изменить"))
+                }
+            });
+
+        div()
+            .mt_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(div().w(px(240.0)).text_sm().child(label))
+            .child(field)
+            .when(!is_default && !recording, |el| {
+                el.child(link(
+                    if is_scan { "hk-scan-reset" } else { "hk-hide-reset" },
+                    "по умолчанию",
+                    cx.listener(move |this, _, _, cx| {
+                        let sc = &mut this.scanner;
+                        let (mine, other) =
+                            if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
+                        let new = default.to_string();
+                        if other.eq_ignore_ascii_case(&new) {
+                            *other = mine.clone();
+                        }
+                        *mine = new;
+                        cx.notify();
+                    }),
+                ))
+            })
+    }
+}
+
+/// Предметы для примера в превью оверлея.
+const PREVIEW_ITEMS: [(&str, &str); 4] = [
+    ("5c0530ee86f774697952d952", "LEDX"),
+    ("57347ca924597744596b4e71", "GPU"),
+    ("5c1d0f4986f7744bb01837fa", "Черная"),
+    ("59faff1d86f7746c51718c9c", "0.2BTC"),
+];
+
+impl HelperApp {
+    /// Превью: как оверлей сканера будет выглядеть поверх игры.
+    fn render_overlay_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let col = div().flex_1().min_w(px(420.0)).max_w(px(640.0)).pr(px(32.0)).py(px(24.0));
+        let Some(d) = self.data.clone() else {
+            return col.child(div().text_color(rgb(MUTED)).child("Загружаю данные для превью…"));
+        };
+        let (item_id, _) = PREVIEW_ITEMS[self.preview_item.min(PREVIEW_ITEMS.len() - 1)];
+        let Some(item) = d.items.get(item_id).cloned() else {
+            return col.child(div().text_color(rgb(MUTED)).child("Предмет для превью не найден в данных"));
+        };
+        let sc = &self.scanner;
+
+        // строки оверлея по настройкам
+        let row = |label: String, value: String, color: u32| {
+            div()
+                .flex()
+                .justify_between()
+                .gap_4()
+                .text_sm()
+                .child(div().text_color(rgb(MUTED)).child(label))
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color)).child(value))
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if sc.show_per_slot {
+            rows.push(
+                row(
+                    format!("За клетку ({}×{})", item.width, item.height),
+                    fmt_rub(item.price() / item.slots() as i64),
+                    tier_color(item.price() / item.slots() as i64),
+                )
+                .into_any_element(),
+            );
+        }
+        if sc.show_flea {
+            let v = if item.flea > 0 { fmt_rub(item.flea) } else { "нельзя продать".into() };
+            rows.push(row("Барахолка".into(), v, TEXT).into_any_element());
+        }
+        if sc.show_trader && item.trader > 0 {
+            rows.push(row(item.trader_name.to_string(), fmt_rub(item.trader), TEXT).into_any_element());
+        }
+        if sc.show_needed {
+            let needs = d.needs.get(item_id).cloned().unwrap_or_default();
+            if needs.is_empty() {
+                rows.push(div().text_xs().text_color(rgb(MUTED)).child("Не нужен для убежища и задач").into_any_element());
+            } else {
+                rows.push(div().mt_1().text_xs().text_color(rgb(GOLD)).child("НУЖЕН").into_any_element());
+                for n in needs.iter().take(4) {
+                    rows.push(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .child(div().child(if n.hideout { "🏠" } else { "📜" }))
+                            .child(div().flex_1().text_color(rgb(TEXT)).child(n.name.clone()))
+                            .child(
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("×{}{}", n.count, if n.found_in_raid { " · FIR" } else { "" })),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                if needs.len() > 4 {
+                    rows.push(
+                        div().text_xs().text_color(rgb(MUTED)).child(format!("и ещё {}", needs.len() - 4)).into_any_element(),
+                    );
+                }
+            }
+        }
+        if rows.is_empty() {
+            rows.push(div().text_sm().text_color(rgb(MUTED)).child("Ничего не выбрано для показа").into_any_element());
+        }
+        let footer = if sc.hold_to_show {
+            format!("пока держишь {}", crate::hotkey::display(&sc.scan_key).join(" + "))
+        } else if sc.show_seconds == 0 {
+            format!("{} — скрыть", crate::hotkey::display(&sc.hide_key).join(" + "))
+        } else {
+            format!("скроется через {} с · {} — скрыть", sc.show_seconds, crate::hotkey::display(&sc.hide_key).join(" + "))
+        };
+        let card = div()
+            .w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .bg(with_alpha(0x15140f, 0xf2))
+            .border_1()
+            .border_color(rgb(GOLD))
+            .shadow_lg()
+            .text_color(rgb(TEXT))
+            .child(div().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child(item.short.clone()))
+            .child(div().text_xs().text_color(rgb(MUTED)).mb_1().child(item.name.clone()))
+            .children(rows)
+            .child(div().mt_2().text_xs().text_color(rgb(MUTED)).child(footer));
+
+        // макет экрана: сетка инвентаря, предмет под курсором, оверлей
+        const CELL: f32 = 48.0;
+        let (screen_w, screen_h) = (560.0, 540.0);
+        let (tile_x, tile_y) = (CELL * 2.0 + 16.0, CELL + 16.0);
+        let (tw, th) = (CELL * item.width as f32, CELL * item.height as f32);
+        let mut screen = div()
+            .relative()
+            .w(px(screen_w))
+            .h(px(screen_h))
+            .overflow_hidden()
+            .bg(rgb(0x1a1b1c))
+            .border_1()
+            .border_color(rgb(GOLD_DIM));
+        for gy in 0..11 {
+            for gx in 0..11 {
+                screen = screen.child(
+                    div()
+                        .absolute()
+                        .left(px(16.0 + gx as f32 * CELL))
+                        .top(px(16.0 + gy as f32 * CELL))
+                        .size(px(CELL - 2.0))
+                        .bg(rgb(0x232425))
+                        .border_1()
+                        .border_color(rgb(0x2e3031)),
+                );
+            }
+        }
+        screen = screen
+            .child(
+                div()
+                    .absolute()
+                    .left(px(tile_x))
+                    .top(px(tile_y))
+                    .w(px(tw - 2.0))
+                    .h(px(th - 2.0))
+                    .bg(rgb(0x3a3d40))
+                    .border_1()
+                    .border_color(rgb(0x9aa0a6))
+                    .flex()
+                    .items_end()
+                    .justify_end()
+                    .p(px(2.0))
+                    .child(div().text_size(px(9.0)).text_color(rgb(0xdddddd)).child(item.short.clone())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(tile_x + tw * 0.6))
+                    .top(px(tile_y + th * 0.6))
+                    .text_lg()
+                    .text_color(rgb(0xffffff))
+                    .child("➤"),
+            );
+        screen = if sc.position == "corner" {
+            screen.child(div().absolute().top(px(12.0)).right(px(12.0)).child(card))
+        } else {
+            screen.child(div().absolute().left(px(tile_x + tw + 14.0)).top(px(tile_y + 10.0)).child(card))
+        };
+
+        col.child(div().text_sm().text_color(rgb(GOLD)).child("КАК ЭТО ВЫГЛЯДИТ"))
+            .child(
+                div()
+                    .mt_1()
+                    .mb_3()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Пример с реальными ценами и требованиями — меняется вместе с настройками слева."),
+            )
+            .child(div().mb_3().flex().gap_1().children(PREVIEW_ITEMS.iter().enumerate().map(|(i, (_, label))| {
+                segmented(
+                    ElementId::named_usize("pv-item", i),
+                    *label,
+                    self.preview_item == i,
+                    cx.listener(move |this, _, _, cx| {
+                        this.preview_item = i;
+                        cx.notify();
+                    }),
+                )
+            })))
+            .child(screen)
+    }
+}
+
+impl HelperApp {
+    /// Раздел «Рейды»: средний профит по картам и история.
+    fn render_raids(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let raids = self.raid_log.read(cx).raids.clone();
+        let mode = self.raids_mode;
+        let stats = crate::raids::stats(&raids, mode);
+        let map_name = |id: &str| {
+            crate::maps::MAPS.iter().find(|m| m.id == id).map(|m| m.name).unwrap_or("?").to_string()
+        };
+        let heading = |t: &'static str| div().mt_6().mb_2().text_sm().text_color(rgb(GOLD)).child(t);
+
+        // таблица по картам, по убыванию среднего профита
+        let mut rows: Vec<(String, crate::raids::MapStats)> = stats.into_iter().collect();
+        rows.sort_by(|a, b| b.1.avg().cmp(&a.1.avg()));
+        let cell = |t: String, w: f32, color: u32, bold: bool| {
+            div()
+                .w(px(w))
+                .text_color(rgb(color))
+                .when(bold, |el| el.font_weight(FontWeight::BOLD))
+                .child(t)
+        };
+        let header = div()
+            .flex()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(GOLD_DIM))
+            .text_xs()
+            .child(cell("КАРТА".into(), 200.0, MUTED, false))
+            .child(cell("РЕЙДОВ".into(), 90.0, MUTED, false))
+            .child(cell("СРЕДНИЙ ПРОФИТ".into(), 160.0, MUTED, false))
+            .child(cell("ЛУЧШИЙ".into(), 130.0, MUTED, false))
+            .child(cell("ВСЕГО".into(), 130.0, MUTED, false));
+        let table = div().flex().flex_col().child(header).children(rows.iter().map(|(map, st)| {
+            div()
+                .flex()
+                .py(px(6.0))
+                .border_b_1()
+                .border_color(rgb(0x2a2824))
+                .child(cell(map_name(map), 200.0, TEXT, true))
+                .child(cell(st.raids.to_string(), 90.0, TEXT, false))
+                .child(cell(fmt_rub(st.avg()), 160.0, tier_color(st.avg()), true))
+                .child(cell(fmt_short(st.best), 130.0, TEXT, false))
+                .child(cell(fmt_short(st.total), 130.0, MUTED, false))
+        }));
+
+        // история, новые сверху
+        let history: Vec<AnyElement> = raids.iter().enumerate().rev().filter(|(_, r)| mode.is_none_or(|m| r.mode == m)).map(|(i, r)| {
+            let open = self.open_raid == Some(i);
+            let when = chrono::DateTime::from_timestamp(r.ts as i64, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%d.%m %H:%M").to_string())
+                .unwrap_or_default();
+            div()
+                .flex()
+                .flex_col()
+                .border_b_1()
+                .border_color(rgb(0x2a2824))
+                .child(
+                    div()
+                        .id(ElementId::named_usize("raid", i))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(CARD)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_raid = if this.open_raid == Some(i) { None } else { Some(i) };
+                            cx.notify();
+                        }))
+                        .child(div().w(px(12.0)).text_color(rgb(GOLD_DIM)).child(if open { "▾" } else { "▸" }))
+                        .child(div().w(px(100.0)).text_sm().text_color(rgb(MUTED)).child(when))
+                        .child(div().w(px(150.0)).font_weight(FontWeight::SEMIBOLD).child(map_name(&r.map)))
+                        .child(div().w(px(50.0)).text_xs().text_color(rgb(MUTED)).child(r.mode.to_uppercase()))
+                        .child(div().w(px(90.0)).text_sm().text_color(rgb(MUTED)).child(format!("{} предм.", r.items.len())))
+                        .child(div().flex_1().font_weight(FontWeight::BOLD).text_color(rgb(tier_color(r.total()))).child(fmt_rub(r.total())))
+                        .child(
+                            div()
+                                .id(ElementId::named_usize("raid-del", i))
+                                .px_2()
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.text_color(rgb(0xff6b6b)))
+                                .child("✕")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.raid_log.update(cx, |log, cx| log.remove(i, cx));
+                                    this.open_raid = None;
+                                    cx.stop_propagation();
+                                })),
+                        ),
+                )
+                .when(open, |el| {
+                    el.child(div().pl(px(28.0)).pb_2().flex().flex_col().gap(px(2.0)).children(r.items.iter().map(|it| {
+                        div()
+                            .flex()
+                            .text_sm()
+                            .child(div().w(px(220.0)).child(if it.count > 1 { format!("{} ×{}", it.short, it.count) } else { it.short.clone() }))
+                            .child(div().text_color(rgb(MUTED)).child(fmt_rub(it.price * it.count as i64)))
+                    })))
+                })
+                .into_any_element()
+        }).collect();
+
+        let modes: [(&'static str, &'static str, Option<&'static str>); 3] =
+            [("rm-all", "Все", None), ("rm-pve", "PvE", Some("pve")), ("rm-pvp", "PvP", Some("pvp"))];
+        let mode_chips: Vec<AnyElement> = modes
+            .into_iter()
+            .map(|(id, label, value)| {
+                segmented(id, label, self.raids_mode == value, cx.listener(move |this, _, _, cx| {
+                    this.raids_mode = value;
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("raids-page")
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .max_w(px(820.0))
+                    .px(px(32.0))
+                    .py(px(24.0))
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child("РЕЙДЫ"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("После рейда наведись на рюкзак и нажми хоткей сканера: оверлей распознает предметы, ты уберёшь лишнее, выберешь карту — и рейд попадёт в статистику."),
+                    )
+                    .child(
+                        div()
+                            .mt_4()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("raid-sample")
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(GOLD))
+                                    .text_color(rgb(0x1a1a1a))
+                                    .font_weight(FontWeight::BOLD)
+                                    .cursor_pointer()
+                                    .hover(|s| s.opacity(0.9))
+                                    .child("Открыть оверлей после рейда (пример)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let Some(d) = this.data.clone() else { return };
+                                        let rows = crate::raid_overlay::sample_backpack(&d);
+                                        let mode = if this.mode == Mode::Pvp { "pvp" } else { "pve" }.to_string();
+                                        crate::raid_overlay::open(rows, mode, this.raid_log.clone(), true, cx);
+                                    })),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Настоящее распознавание — в сканере под Windows")),
+                    )
+                    .child(
+                        div()
+                            .mt_6()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().text_color(rgb(GOLD)).child("СРЕДНИЙ ПРОФИТ ПО КАРТАМ"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .children(mode_chips),
+                            ),
+                    )
+                    .child(if rows.is_empty() {
+                        div().mt_2().text_sm().text_color(rgb(MUTED)).child("Пока нет рейдов — подтверди первый в оверлее.")
+                    } else {
+                        div().mt_2().child(table)
+                    })
+                    .child(heading("ИСТОРИЯ"))
+                    .children(history),
+            )
     }
 }

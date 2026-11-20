@@ -1,6 +1,6 @@
 [package]
 name = "tarkov-helper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Карта ценного лута Лаборатории для Escape from Tarkov"
 repository = "https://github.com/bobisdacool1/TarkovHelper"
@@ -8,9 +8,11 @@ repository = "https://github.com/bobisdacool1/TarkovHelper"
 [dependencies]
 anyhow = "1.0.104"
 cargo-packager-updater = "0.2.3"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -21,6 +23,12 @@ ureq = "2"
 # свой код остаётся быстро собираемым.
 [profile.dev.package."*"]
 opt-level = 3
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
 
 [profile.release]
 lto = "thin"
@@ -33,7 +41,7 @@ product-name = "Tarkov Helper"
 identifier = "io.github.bobisdacool1.tarkovhelper"
 category = "Utility"
 copyright = "bobisdacool1"
-icons = ["assets/app-icon/*.png"]
+icons = ["assets/app-icon/*.png", "assets/windows/app.ico"]
 out-dir = "dist"
 
 [package.metadata.packager.macos]

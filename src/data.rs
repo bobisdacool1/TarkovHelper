@@ -35,7 +35,8 @@ impl Mode {
 
 /// Файлы, которые качаем целиком (полный дамп режима).
 const DUMP_FILES: &[&str] = &[
-    "items", "items_ru", "items_en", "maps", "maps_ru", "traders", "barters", "crafts", "tasks", "hideout",
+    "items", "items_ru", "items_en", "maps", "maps_ru", "traders", "barters", "crafts", "tasks", "tasks_ru",
+    "hideout", "hideout_ru",
 ];
 
 pub fn data_dir() -> PathBuf {
@@ -117,6 +118,8 @@ struct RawItem {
     types: Vec<String>,
     #[serde(default)]
     categories: Vec<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -184,11 +187,17 @@ pub struct Item {
     pub trader_name: &'static str,
     /// Индекс подкатегории в `categories::GROUPS`.
     pub group: usize,
+    pub width: u32,
+    pub height: u32,
     /// Строка для поиска: ру/англ полные и короткие имена, в нижнем регистре, ё→е.
     pub search: String,
 }
 
 impl Item {
+    pub fn slots(&self) -> u32 {
+        (self.width * self.height).max(1)
+    }
+
     pub fn price(&self) -> i64 {
         self.flea.max(self.trader)
     }
@@ -222,6 +231,15 @@ pub struct Extract {
     pub floor: usize,
 }
 
+/// Зачем предмет нужен: уровень убежища или задача.
+#[derive(Clone, Debug)]
+pub struct Need {
+    pub hideout: bool,
+    pub name: String,
+    pub count: u32,
+    pub found_in_raid: bool,
+}
+
 pub struct LabData {
     pub mode: Mode,
     pub fetched_at: Option<u64>,
@@ -230,6 +248,8 @@ pub struct LabData {
     pub locks: Vec<Lock>,
     pub extracts: Vec<Extract>,
     pub rooms: Vec<Room>,
+    /// item id -> где нужен.
+    pub needs: HashMap<String, Vec<Need>>,
 }
 
 impl LabData {
@@ -298,6 +318,8 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
                 trader: best.map(|b| b.0).unwrap_or(0),
                 trader_name: best.map(|b| trader_name(b.1)).unwrap_or(""),
                 group: categories::group_of(cat),
+                width: raw.width.unwrap_or(1),
+                height: raw.height.unwrap_or(1),
                 search,
             };
             (raw.id, item)
@@ -347,7 +369,9 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
         pos: t.position,
     }));
 
-    Ok(LabData { mode, fetched_at, items, loot, locks, extracts, rooms })
+    let needs = load_needs(&dir);
+
+    Ok(LabData { mode, fetched_at, items, loot, locks, extracts, rooms, needs })
 }
 
 pub fn normalize(s: &str) -> String {
@@ -374,4 +398,71 @@ pub fn fmt_short(v: i64) -> String {
     } else {
         v.to_string()
     }
+}
+
+/// Требования убежища и задач по предметам. Файлов может не быть — тогда пусто.
+fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
+    use serde_json::Value;
+    let read = |name: &str| -> Option<Value> {
+        let v: Value = serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()?;
+        v.get("data").cloned()
+    };
+    let tr = |v: &Option<Value>, key: &str| -> String {
+        v.as_ref().and_then(|t| t.get(key)).and_then(|s| s.as_str()).unwrap_or(key).to_string()
+    };
+    let values = |v: &Value| -> Vec<Value> {
+        match v {
+            Value::Object(m) => m.values().cloned().collect(),
+            Value::Array(a) => a.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let mut needs: HashMap<String, Vec<Need>> = HashMap::new();
+
+    if let Some(hideout) = read("hideout.json") {
+        let names = read("hideout_ru.json");
+        let stations = hideout.get("hideoutStations").cloned().unwrap_or(hideout);
+        for st in values(&stations) {
+            let station = tr(&names, st["name"].as_str().unwrap_or(""));
+            for lv in st["levels"].as_array().into_iter().flatten() {
+                let level = lv["level"].as_u64().unwrap_or(0);
+                for r in lv["itemRequirements"].as_array().into_iter().flatten() {
+                    let Some(item) = r["item"].as_str() else { continue };
+                    needs.entry(item.to_string()).or_default().push(Need {
+                        hideout: true,
+                        name: format!("{station}, ур. {level}"),
+                        count: r["count"].as_u64().unwrap_or(1) as u32,
+                        found_in_raid: r["attributes"]["foundInRaid"].as_bool().unwrap_or(false),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(tasks) = read("tasks.json") {
+        let names = read("tasks_ru.json");
+        let list = tasks.get("tasks").cloned().unwrap_or(tasks);
+        for task in values(&list) {
+            let name = tr(&names, task["name"].as_str().unwrap_or(""));
+            for o in task["objectives"].as_array().into_iter().flatten() {
+                if o["type"].as_str() != Some("giveItem") {
+                    continue;
+                }
+                // «сдать любой из 30 предметов» — не про конкретный предмет
+                let items = o["items"].as_array().cloned().unwrap_or_default();
+                if items.len() > 3 {
+                    continue;
+                }
+                for it in items.iter().filter_map(|i| i.as_str()) {
+                    needs.entry(it.to_string()).or_default().push(Need {
+                        hideout: false,
+                        name: name.clone(),
+                        count: o["count"].as_u64().unwrap_or(1) as u32,
+                        found_in_raid: o["foundInRaid"].as_bool().unwrap_or(false),
+                    });
+                }
+            }
+        }
+    }
+    needs
 }

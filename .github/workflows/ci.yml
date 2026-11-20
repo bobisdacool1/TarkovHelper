@@ -1,0 +1,40 @@
+name: CI
+
+# Каждый пуш в main и PR: собираем под macOS и Windows, на Windows проверяем,
+# что иконка вшита в .exe.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      - name: Check exe icon
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Icons {
+            [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+            public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          }
+          "@
+          $n = [Icons]::ExtractIconEx("target\debug\tarkov-helper.exe", -1, $null, $null, 0)
+          Write-Host "Иконок в exe: $n"
+          if ($n -lt 1) { Write-Host "::error::в tarkov-helper.exe нет иконки"; exit 1 }
+          Write-Host "::notice title=exe icon::в tarkov-helper.exe иконок: $n"

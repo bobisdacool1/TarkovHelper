@@ -1,7 +1,11 @@
 mod app;
 mod categories;
 mod data;
+mod hotkey;
 mod labs;
+mod maps;
+mod raid_overlay;
+mod raids;
 mod settings;
 mod text_input;
 mod tiles;

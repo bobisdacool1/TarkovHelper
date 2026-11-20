@@ -22,6 +22,53 @@ pub struct Settings {
     pub show_rooms: bool,
     pub show_extracts: bool,
     pub auto_refresh: bool,
+    /// Открытый раздел: "maps" | "scanner".
+    pub section: String,
+    /// Выбранная карта (id из maps.rs).
+    pub map: String,
+    pub scanner: ScannerSettings,
+}
+
+/// Настройки сканера цен (оверлей поверх игры, только Windows).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScannerSettings {
+    pub enabled: bool,
+    /// Клавиша сканирования предмета под курсором.
+    pub scan_key: String,
+    /// Клавиша скрытия оверлея.
+    pub hide_key: String,
+    pub show_flea: bool,
+    pub show_trader: bool,
+    pub show_per_slot: bool,
+    /// Нужно ли для убежища и задач.
+    pub show_needed: bool,
+    /// Показывать оверлей, только пока держу клавишу сканирования.
+    /// На оверлей после рейда не действует — он висит до подтверждения.
+    pub hold_to_show: bool,
+    pub hide_on_mouse_move: bool,
+    /// Сколько секунд держать оверлей; 0 — пока не скрою клавишей.
+    pub show_seconds: u32,
+    /// "cursor" | "corner"
+    pub position: String,
+}
+
+impl Default for ScannerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scan_key: "F9".into(),
+            hide_key: "F10".into(),
+            show_flea: true,
+            show_trader: true,
+            show_per_slot: true,
+            show_needed: true,
+            hold_to_show: false,
+            hide_on_mouse_move: true,
+            show_seconds: 5,
+            position: "cursor".into(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -39,6 +86,9 @@ impl Default for Settings {
             show_rooms: true,
             show_extracts: true,
             auto_refresh: true,
+            section: "maps".into(),
+            map: "the-lab".into(),
+            scanner: ScannerSettings::default(),
         }
     }
 }
