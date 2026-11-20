@@ -44,12 +44,93 @@ impl ItemBox {
     /// Полоска ярлыка: короткое имя написано в правом верхнем углу, выровнено по правому краю.
     /// Берём не больше трёх правых клеток — левее у длинных предметов только картинка.
     pub fn label_rect(&self, cell: f32) -> (u32, u32, u32, u32) {
+        // отступы слева и сверху — мимо рамки предмета: у подсвеченных она яркая голубая,
+        // и OCR читает её как «[»; справа текст подходит к краю вплотную — там отступ меньше
         let x1 = self.x1.saturating_sub(2);
-        let x0 = (self.x0 + 2).max(x1.saturating_sub((cell * 3.0) as u32));
-        let y0 = self.y0 + 1;
+        let x0 = (self.x0 + 5).max(x1.saturating_sub((cell * 3.0) as u32));
+        let y0 = self.y0 + 3;
         let y1 = (self.y0 + (cell * 0.27).round() as u32).min(self.y1);
         (x0, y0, x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1))
     }
+
+    /// Видимая часть ярлыка, если подсказка игры его задевает. Текст выровнен по правому краю:
+    /// закрыт правый край — ярлык не прочитать (None), закрыта только левая часть — берём правую.
+    pub fn visible_label(&self, cell: f32, tip: Option<Rect>) -> Option<(u32, u32, u32, u32)> {
+        let (x, y, w, h) = self.label_rect(cell);
+        let Some(t) = tip.filter(|t| t.intersects(x, y, x + w, y + h)) else {
+            return Some((x, y, w, h));
+        };
+        let x1 = x + w;
+        if t.x1 + 2 >= x1 {
+            return None;
+        }
+        let x0 = t.x1 + 2;
+        (x1 - x0 >= (cell * 0.35) as u32).then_some((x0, y, x1 - x0, h))
+    }
+}
+
+/// Прямоугольник на снимке (x1, y1 — не включительно).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl Rect {
+    pub fn intersects(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        x0 < self.x1 && self.x0 < x1 && y0 < self.y1 && self.y0 < y1
+    }
+    fn contains_i(&self, x: i32, y: i32, margin: i32) -> bool {
+        x >= self.x0 as i32 - margin
+            && x < self.x1 as i32 + margin
+            && y >= self.y0 as i32 - margin
+            && y < self.y1 as i32 + margin
+    }
+}
+
+/// Подсказка игры с полным именем предмета: чёрный прямоугольник с серой рамкой в 1 px
+/// рядом с курсором. Она закрывает ярлыки и сбивает поиск рамок — её область исключаем,
+/// а имя наведённого предмета читаем из неё.
+pub fn find_tooltip(g: &GrayImage, cx: u32, cy: u32, cell: f32) -> Option<Rect> {
+    let (w, h) = (g.width() as i32, g.height() as i32);
+    let border = |x: i32, y: i32| (65..=115).contains(&px(g, x, y));
+    let dark = |x: i32, y: i32| px(g, x, y) <= 6;
+    let (cx, cy) = (cx as i32, cy as i32);
+    let xs = ((cx - (cell * 6.0) as i32).max(1), (cx + (cell * 6.0) as i32).min(w - 2));
+    let ys = ((cy - (cell * 3.0) as i32).max(1), (cy + (cell * 3.0) as i32).min(h - 4));
+    let min_w = (cell * 0.9) as i32;
+    let max_h = (cell * 3.0) as i32;
+    for y in ys.0..ys.1 {
+        let mut x = xs.0;
+        while x < xs.1 {
+            // верхняя рамка: серая строка, под ней чёрное поле
+            if !(border(x, y) && dark(x, y + 1) && dark(x, y + 2)) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < xs.1 && border(x, y) && dark(x, y + 1) && dark(x, y + 2) {
+                x += 1;
+            }
+            let (xl, xr) = (start - 1, x);
+            if x - start < min_w || !border(xl, y + 3) || !border(xr, y + 3) {
+                continue;
+            }
+            // левая и правая рамки вниз до нижней рамки
+            let full = |yy: i32| (xl + 2..xr - 1).filter(|&xx| border(xx, yy)).count() as i32 * 10 >= (xr - xl - 3) * 9;
+            let mut yb = y + 1;
+            while yb - y < max_h && yb < h - 1 && border(xl, yb) && border(xr, yb) && !full(yb) {
+                yb += 1;
+            }
+            let height = yb - y;
+            if height >= (cell * 0.35) as i32 && height < max_h && full(yb) {
+                return Some(Rect { x0: xl as u32, y0: y as u32, x1: xr as u32 + 1, y1: yb as u32 + 1 });
+            }
+        }
+    }
+    None
 }
 
 /// Размер клетки по разрешению экрана: 63 px в 1920×1080, интерфейс масштабируется по меньшей стороне.
@@ -168,9 +249,16 @@ struct Cells<'a> {
     g: &'a GrayImage,
     lat: Lattice,
     d: i32,
+    /// Область подсказки игры — её пиксели не смотрим.
+    mask: Option<Rect>,
 }
 
 impl Cells<'_> {
+    /// Точка рядом с подсказкой (с запасом на соседей, которых берут отклики линий).
+    fn hidden(&self, x: i32, y: i32) -> bool {
+        self.mask.is_some_and(|m| m.contains_i(x, y, self.d + 3))
+    }
+
     fn inside(&self, c: i32, r: i32) -> bool {
         let m = self.d as f32 + 2.0;
         self.lat.x(c) >= m
@@ -189,6 +277,10 @@ impl Cells<'_> {
         while y < self.lat.y(r + 1) - m {
             let mut x = self.lat.x(c) + m;
             while x < self.lat.x(c + 1) - m {
+                if self.hidden(x as i32, y as i32) {
+                    x += step;
+                    continue;
+                }
                 let v = px(self.g, x as i32, y as i32) as f64;
                 sum += v;
                 sum2 += v * v;
@@ -197,7 +289,7 @@ impl Cells<'_> {
             }
             y += step;
         }
-        if n == 0.0 {
+        if n < 10.0 {
             return false;
         }
         let mean = sum / n;
@@ -207,7 +299,8 @@ impl Cells<'_> {
     /// Доля точек отрезка, где линия светлее фона больше чем на `thr`.
     /// Вертикальный отрезок: линия x = lat.x(c), строка r; горизонтальный — y = lat.y(r), столбец c.
     /// Фаза решётки известна с точностью до пары пикселей — берём лучший сдвиг.
-    fn line_frac(&self, c: i32, r: i32, vertical: bool, thr: i32) -> f32 {
+    /// None — граница почти вся под подсказкой игры, судить не по чему.
+    fn line_frac(&self, c: i32, r: i32, vertical: bool, thr: i32) -> Option<f32> {
         let s = self.lat.cell;
         let trim = s * 0.14;
         let (from, to) = if vertical {
@@ -216,12 +309,18 @@ impl Cells<'_> {
             (self.lat.x(c) + trim, self.lat.x(c + 1) - trim)
         };
         let base = if vertical { self.lat.x(c) } else { self.lat.y(r) }.round() as i32;
-        let mut best = 0.0f32;
+        let total = (to - from).max(1.0);
+        let mut best: Option<f32> = None;
         for off in -2..=2 {
             let line = base + off;
             let (mut hit, mut n) = (0, 0);
             let mut t = from;
             while t < to {
+                let (hx, hy) = if vertical { (line, t as i32) } else { (t as i32, line) };
+                if self.hidden(hx, hy) {
+                    t += 1.0;
+                    continue;
+                }
                 let resp = if vertical {
                     vline(self.g, line, t as i32, self.d)
                 } else {
@@ -231,8 +330,9 @@ impl Cells<'_> {
                 n += 1;
                 t += 1.0;
             }
-            if n > 0 {
-                best = best.max(hit as f32 / n as f32);
+            if n as f32 >= (total * 0.15).max(8.0) {
+                let f = hit as f32 / n as f32;
+                best = Some(best.map_or(f, |b| b.max(f)));
             }
         }
         best
@@ -241,7 +341,7 @@ impl Cells<'_> {
     /// Доля точек границы, где фон по одну сторону ровно светлее (или темнее), чем по другую.
     /// У каждого предмета свой однотонный фон, а картинка внутри одного предмета через границу
     /// клеток идёт непрерывно — перепады случайные и разного знака.
-    fn step_frac(&self, c: i32, r: i32, vertical: bool) -> f32 {
+    fn step_frac(&self, c: i32, r: i32, vertical: bool) -> Option<f32> {
         let s = self.lat.cell;
         let trim = s * 0.14;
         let k = self.d + 2;
@@ -254,6 +354,11 @@ impl Cells<'_> {
         let mut diffs = Vec::new();
         let mut t = from;
         while t < to {
+            let (hx, hy) = if vertical { (line, t as i32) } else { (t as i32, line) };
+            if self.hidden(hx, hy) {
+                t += 1.0;
+                continue;
+            }
             let (a, b) = if vertical {
                 (px(self.g, line - k, t as i32), px(self.g, line + k, t as i32))
             } else {
@@ -262,8 +367,8 @@ impl Cells<'_> {
             diffs.push(b - a);
             t += 1.0;
         }
-        if diffs.is_empty() {
-            return 0.0;
+        if (diffs.len() as f32) < ((to - from) * 0.15).max(8.0) {
+            return None;
         }
         // перепад двух однотонных фонов почти одинаков вдоль всей границы (6±1),
         // а градиент или картинка внутри предмета дают разброс
@@ -271,20 +376,24 @@ impl Cells<'_> {
         sorted.sort();
         let m = sorted[sorted.len() / 2];
         if m.abs() < 3 {
-            return 0.0;
+            return Some(0.0);
         }
-        diffs.iter().filter(|d| (**d - m).abs() <= 1).count() as f32 / diffs.len() as f32
+        Some(diffs.iter().filter(|d| (**d - m).abs() <= 1).count() as f32 / diffs.len() as f32)
     }
 
     /// Разные ли предметы в соседних занятых клетках: светлая рамка между ними
-    /// (внутри одного предмета доля 0,03–0,23, между разными 0,83–1,00) или перепад фона.
-    fn split(&self, c: i32, r: i32, vertical: bool) -> bool {
-        self.line_frac(c, r, vertical, 10) >= 0.5 || self.step_frac(c, r, vertical) >= 0.6
+    /// (внутри одного предмета доля 0,03–0,23, между разными 0,83–1,00) или ровный перепад фона
+    /// (у Wedge и жетона 0,87; градиент и картинка внутри одного предмета — до 0,62).
+    /// None — граница под подсказкой игры: не склеиваем и не разделяем, решат соседние границы.
+    fn split(&self, c: i32, r: i32, vertical: bool) -> Option<bool> {
+        let line = self.line_frac(c, r, vertical, 10)?;
+        let step = self.step_frac(c, r, vertical)?;
+        Some(line >= 0.5 || step >= 0.75)
     }
-    fn split_right(&self, c: i32, r: i32) -> bool {
+    fn split_right(&self, c: i32, r: i32) -> Option<bool> {
         self.split(c + 1, r, true)
     }
-    fn split_down(&self, c: i32, r: i32) -> bool {
+    fn split_down(&self, c: i32, r: i32) -> Option<bool> {
         self.split(c, r + 1, false)
     }
 }
@@ -315,10 +424,10 @@ impl Groups {
                     continue;
                 }
                 let (ac, ar) = (c0 + c, r0 + r);
-                if c + 1 < n && g.occ[(r * n + c + 1) as usize] && !cells.split_right(ac, ar) {
+                if c + 1 < n && g.occ[(r * n + c + 1) as usize] && cells.split_right(ac, ar) == Some(false) {
                     g.union((r * n + c) as usize, (r * n + c + 1) as usize);
                 }
-                if r + 1 < n && g.occ[((r + 1) * n + c) as usize] && !cells.split_down(ac, ar) {
+                if r + 1 < n && g.occ[((r + 1) * n + c) as usize] && cells.split_down(ac, ar) == Some(false) {
                     g.union((r * n + c) as usize, ((r + 1) * n + c) as usize);
                 }
             }
@@ -376,14 +485,14 @@ fn to_box(lat: &Lattice, cells: &[(i32, i32)]) -> ItemBox {
     }
 }
 
-fn cells_for(g: &GrayImage, lat: Lattice) -> Cells<'_> {
-    Cells { g, lat, d: ((lat.cell * 0.048).round() as i32).max(3) }
+fn cells_for(g: &GrayImage, lat: Lattice, mask: Option<Rect>) -> Cells<'_> {
+    Cells { g, lat, d: ((lat.cell * 0.048).round() as i32).max(3), mask }
 }
 
 /// Предмет под курсором: сетка вокруг, клетка под курсором и склеенный с ней квадрат.
-pub fn item_at(g: &GrayImage, cx: u32, cy: u32, hint: f32) -> Option<(ItemBox, Lattice)> {
+pub fn item_at(g: &GrayImage, cx: u32, cy: u32, hint: f32, mask: Option<Rect>) -> Option<(ItemBox, Lattice)> {
     let lat = find_lattice(g, cx, cy, hint)?;
-    let cells = cells_for(g, lat);
+    let cells = cells_for(g, lat, mask);
     let (cc, cr) = (lat.col(cx as f32), lat.row(cy as f32));
     if !cells.inside(cc, cr) || !cells.occupied(cc, cr) {
         return None;
@@ -397,9 +506,15 @@ pub fn item_at(g: &GrayImage, cx: u32, cy: u32, hint: f32) -> Option<(ItemBox, L
 /// Все предметы контейнера под курсором (рюкзак, разгрузка, карманы).
 /// Контейнер — связная область «клеток сетки»: пустых клеток и предметов, по краям которых
 /// идут линии решётки. Фон вокруг и соседние контейнеры с другой фазой сетки сюда не попадают.
-pub fn items_around(g: &GrayImage, cx: u32, cy: u32, hint: f32) -> Option<(Vec<ItemBox>, Lattice)> {
+pub fn items_around(
+    g: &GrayImage,
+    cx: u32,
+    cy: u32,
+    hint: f32,
+    mask: Option<Rect>,
+) -> Option<(Vec<ItemBox>, Lattice)> {
     let lat = find_lattice(g, cx, cy, hint)?;
-    let cells = cells_for(g, lat);
+    let cells = cells_for(g, lat, mask);
     let (cc, cr) = (lat.col(cx as f32), lat.row(cy as f32));
     const R: i32 = 12;
     let mut groups = Groups::build(&cells, cc, cr, R);
@@ -417,20 +532,15 @@ pub fn items_around(g: &GrayImage, cx: u32, cy: u32, hint: f32) -> Option<(Vec<I
         let set: std::collections::HashSet<(i32, i32)> = members.iter().copied().collect();
         let (mut sum, mut n) = (0.0, 0);
         for &(c, r) in members {
-            if !set.contains(&(c - 1, r)) {
-                sum += cells.line_frac(c, r, true, 5);
-                n += 1;
-            }
-            if !set.contains(&(c + 1, r)) {
-                sum += cells.line_frac(c + 1, r, true, 5);
-                n += 1;
-            }
-            if !set.contains(&(c, r - 1)) {
-                sum += cells.line_frac(c, r, false, 5);
-                n += 1;
-            }
-            if !set.contains(&(c, r + 1)) {
-                sum += cells.line_frac(c, r + 1, false, 5);
+            // стороны под подсказкой игры не считаем
+            let sides = [
+                (!set.contains(&(c - 1, r))).then(|| cells.line_frac(c, r, true, 5)),
+                (!set.contains(&(c + 1, r))).then(|| cells.line_frac(c + 1, r, true, 5)),
+                (!set.contains(&(c, r - 1))).then(|| cells.line_frac(c, r, false, 5)),
+                (!set.contains(&(c, r + 1))).then(|| cells.line_frac(c, r + 1, false, 5)),
+            ];
+            for f in sides.into_iter().flatten().flatten() {
+                sum += f;
                 n += 1;
             }
         }
@@ -466,6 +576,14 @@ pub fn items_around(g: &GrayImage, cx: u32, cy: u32, hint: f32) -> Option<(Vec<I
     }
     items.sort_by_key(|b| (b.y0, b.x0));
     Some((items, lat))
+}
+
+/// Для отладки: (доля светлой рамки, доля ровного перепада) на границе клетки.
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn debug_boundary(g: &GrayImage, lat: Lattice, c: i32, r: i32, vertical: bool) -> (f32, f32) {
+    let cells = cells_for(g, lat, find_tooltip(g, 400, 300, lat.cell));
+    (cells.line_frac(c, r, vertical, 10).unwrap_or(-1.0), cells.step_frac(c, r, vertical).unwrap_or(-1.0))
 }
 
 #[cfg(test)]
@@ -506,18 +624,18 @@ mod tests {
             ((330, 180), (1, 1)), // Wires
         ];
         for ((x, y), (w, h)) in cases {
-            let (b, _) = item_at(&g, x, y, HINT).unwrap_or_else(|| panic!("нет предмета в ({x},{y})"));
+            let (b, _) = item_at(&g, x, y, HINT, None).unwrap_or_else(|| panic!("нет предмета в ({x},{y})"));
             assert_eq!((b.w, b.h), (w, h), "размер в ({x},{y}): {b:?}");
             assert!(b.exact);
         }
         // пустая клетка
-        assert!(item_at(&g, 300, 450, HINT).is_none());
+        assert!(item_at(&g, 300, 450, HINT, None).is_none());
     }
 
     #[test]
     fn whole_backpack() {
         let g = backpack();
-        let (items, _) = items_around(&g, 300, 450, HINT).expect("сетка не найдена");
+        let (items, _) = items_around(&g, 300, 450, HINT, None).expect("сетка не найдена");
         // слот самого рюкзака слева (рамка с ярлыком Tri-Zip) тоже похож на предмет — его можно
         // снять галочкой в окне «После рейда»; здесь проверяем содержимое сетки (рамка с x = 205)
         let items: Vec<ItemBox> = items.into_iter().filter(|b| b.x0 >= 200).collect();

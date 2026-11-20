@@ -47,6 +47,8 @@ pub struct Matcher<'a> {
     items: &'a HashMap<String, Item>,
     /// ключ короткого имени (ру и англ) → id предметов
     index: HashMap<String, Vec<&'a str>>,
+    /// ключ полного имени (ру и англ) → id: подсказка игры при наведении
+    names: HashMap<String, Vec<&'a str>>,
 }
 
 /// Что нашлось по ярлыку.
@@ -59,54 +61,25 @@ pub struct Found<'a> {
 impl<'a> Matcher<'a> {
     pub fn new(items: &'a HashMap<String, Item>) -> Self {
         let mut index: HashMap<String, Vec<&'a str>> = HashMap::new();
+        let mut names: HashMap<String, Vec<&'a str>> = HashMap::new();
         for it in items.values() {
-            for name in [&it.short, &it.short_en] {
+            for (full, name) in [(false, &it.short), (false, &it.short_en), (true, &it.name), (true, &it.name_en)] {
+                let map = if full { &mut names } else { &mut index };
                 let k = key(name);
                 if k.is_empty() {
                     continue;
                 }
-                let ids = index.entry(k).or_default();
+                let ids = map.entry(k).or_default();
                 if !ids.contains(&it.id.as_str()) {
                     ids.push(it.id.as_str());
                 }
             }
         }
-        Self { items, index }
+        Self { items, index, names }
     }
 
     fn candidates(&self, q: &str) -> Vec<&'a str> {
-        if let Some(ids) = self.index.get(q) {
-            return ids.clone();
-        }
-        let qc: Vec<char> = q.chars().collect();
-        // игра обрезает длинные имена: «Augmenti»
-        if qc.len() >= 4 {
-            let mut v: Vec<&'a str> =
-                self.index.iter().filter(|(k, _)| k.starts_with(q)).flat_map(|(_, ids)| ids.iter().copied()).collect();
-            if !v.is_empty() {
-                v.sort();
-                v.dedup();
-                return v;
-            }
-        }
-        if qc.len() < 3 {
-            return Vec::new();
-        }
-        // похожее: ошибки OCR в одной-двух буквах
-        let mut best = (0.0f32, Vec::new());
-        for (k, ids) in &self.index {
-            let kc: Vec<char> = k.chars().collect();
-            if kc.len().abs_diff(qc.len()) > 3 {
-                continue;
-            }
-            let ratio = 1.0 - levenshtein(&qc, &kc) as f32 / qc.len().max(kc.len()) as f32;
-            if ratio > best.0 + 1e-6 {
-                best = (ratio, ids.clone());
-            } else if (ratio - best.0).abs() <= 1e-6 {
-                best.1.extend(ids.iter().copied());
-            }
-        }
-        if best.0 >= 0.75 { best.1 } else { Vec::new() }
+        lookup(&self.index, q, true, 0.75)
     }
 
     /// Предмет по тексту ярлыка и размеру квадрата (`exact` — размеру можно верить).
@@ -119,25 +92,78 @@ impl<'a> Matcher<'a> {
             queries.push(key(&words[words.len() - 2..].join("")));
         }
         for q in queries.iter().filter(|q| !q.is_empty()) {
-            let cands = self.candidates(q);
-            if cands.is_empty() {
-                continue;
+            if let Some(f) = self.pick(self.candidates(q), w, h, exact) {
+                return Some(f);
             }
-            let sized: Vec<&'a str> = cands
-                .iter()
-                .copied()
-                .filter(|id| {
-                    let it = &self.items[*id];
-                    (it.width, it.height) == (w, h) || (it.width, it.height) == (h, w)
-                })
-                .collect();
-            // размер не совпал ни у кого: оружие в сборе больше базового, или квадрат склеился неверно
-            let pool = if sized.is_empty() || !exact { cands } else { sized };
-            let best = pool.iter().map(|id| &self.items[*id]).max_by_key(|it| it.price())?;
-            return Some(Found { item: best, others: pool.len() - 1 });
         }
         None
     }
+
+    /// Предмет по полному имени из подсказки игры. Имена длинные — опечатки OCR не страшны,
+    /// но и совпадение требуем почти полное.
+    pub fn find_name(&self, text: &str, w: u32, h: u32, exact: bool) -> Option<Found<'a>> {
+        let q = key(text);
+        if q.chars().count() < 4 {
+            return None;
+        }
+        let cands = lookup(&self.names, &q, false, 0.8);
+        self.pick(cands, w, h, exact)
+    }
+
+    /// Из кандидатов — подходящие по размеру, из них самый дорогой.
+    fn pick(&self, cands: Vec<&'a str>, w: u32, h: u32, exact: bool) -> Option<Found<'a>> {
+        if cands.is_empty() {
+            return None;
+        }
+        let sized: Vec<&'a str> = cands
+            .iter()
+            .copied()
+            .filter(|id| {
+                let it = &self.items[*id];
+                (it.width, it.height) == (w, h) || (it.width, it.height) == (h, w)
+            })
+            .collect();
+        // размер не совпал ни у кого: оружие в сборе больше базового, или квадрат склеился неверно
+        let pool = if sized.is_empty() || !exact { cands } else { sized };
+        let best = pool.iter().map(|id| &self.items[*id]).max_by_key(|it| it.price())?;
+        Some(Found { item: best, others: pool.len() - 1 })
+    }
+}
+
+/// Поиск ключа: точно → по началу (`prefix`) → самое похожее с долей совпадения не ниже `min_ratio`.
+fn lookup<'a>(index: &HashMap<String, Vec<&'a str>>, q: &str, prefix: bool, min_ratio: f32) -> Vec<&'a str> {
+    if let Some(ids) = index.get(q) {
+        return ids.clone();
+    }
+    let qc: Vec<char> = q.chars().collect();
+    // игра обрезает длинные имена: «Augmenti»
+    if prefix && qc.len() >= 4 {
+        let mut v: Vec<&'a str> =
+            index.iter().filter(|(k, _)| k.starts_with(q)).flat_map(|(_, ids)| ids.iter().copied()).collect();
+        if !v.is_empty() {
+            v.sort();
+            v.dedup();
+            return v;
+        }
+    }
+    if qc.len() < 3 {
+        return Vec::new();
+    }
+    // похожее: ошибки OCR в одной-двух буквах
+    let mut best = (0.0f32, Vec::new());
+    for (k, ids) in index {
+        let kc: Vec<char> = k.chars().collect();
+        if kc.len().abs_diff(qc.len()) > 4 {
+            continue;
+        }
+        let ratio = 1.0 - levenshtein(&qc, &kc) as f32 / qc.len().max(kc.len()) as f32;
+        if ratio > best.0 + 1e-6 {
+            best = (ratio, ids.clone());
+        } else if (ratio - best.0).abs() <= 1e-6 {
+            best.1.extend(ids.iter().copied());
+        }
+    }
+    if best.0 >= min_ratio { best.1 } else { Vec::new() }
 }
 
 #[cfg(test)]
@@ -150,6 +176,7 @@ mod tests {
             name: short.into(),
             short: short.into(),
             short_en: short_en.into(),
+            name_en: format!("{short_en} full"),
             flea: price,
             trader: 0,
             trader_name: "",
@@ -185,5 +212,9 @@ mod tests {
         assert_eq!(m.find("Аугментин", 1, 1, true).unwrap().item.id, "aug"); // русская игра
         assert_eq!(m.find("x Roler", 1, 1, true).unwrap().item.id, "roler"); // мусор слева
         assert!(m.find("FrAzenV2", 1, 1, true).is_none());
+        // полное имя из подсказки игры
+        assert_eq!(m.find_name("Roler full", 1, 1, true).unwrap().item.id, "roler");
+        assert_eq!(m.find_name("Ro1er full", 1, 1, true).unwrap().item.id, "roler");
+        assert!(m.find_name("Golden rooster figurine", 1, 1, true).is_none());
     }
 }

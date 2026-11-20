@@ -145,8 +145,13 @@ pub fn ocr_engines() -> &'static [(String, OcrEngine)] {
 }
 
 /// Текст на картинке.
+/// Одновременные вызовы распознавания портят друг другу результат (пустой текст через раз) —
+/// распознаём строго по одному.
+static OCR_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn recognize(engine: &OcrEngine, img: &RgbaImage) -> Result<String> {
     ensure_mta();
+    let _guard = OCR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut bgra = img.as_raw().clone();
     for px in bgra.chunks_exact_mut(4) {
         px.swap(0, 2);

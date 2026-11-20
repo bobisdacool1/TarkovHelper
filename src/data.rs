@@ -182,6 +182,8 @@ pub struct Item {
     pub short: String,
     /// Короткое имя в английской игре — по нему тоже узнаём ярлык в инвентаре.
     pub short_en: String,
+    /// Полное имя в английской игре — его показывает подсказка при наведении.
+    pub name_en: String,
     /// lastLowPrice на барахолке (0, если продать нельзя / нет предложений).
     pub flea: i64,
     /// Лучшая цена продажи торговцу.
@@ -317,6 +319,7 @@ pub fn load_lab(mode: Mode) -> Result<LabData> {
                 name,
                 short,
                 short_en: en_short.to_string(),
+                name_en: en_name.to_string(),
                 flea,
                 trader: best.map(|b| b.0).unwrap_or(0),
                 trader_name: best.map(|b| trader_name(b.1)).unwrap_or(""),
