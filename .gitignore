@@ -3,3 +3,6 @@
 .DS_Store
 *.tmp
 /.claude/
+/tools/scanner-prototype/crops/
+/tools/scanner-prototype/ocr
+/tools/backpack_boxes.png

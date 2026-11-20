@@ -22,7 +22,9 @@ pub struct Settings {
     pub show_rooms: bool,
     pub show_extracts: bool,
     pub auto_refresh: bool,
-    /// Открытый раздел: "maps" | "scanner".
+    /// Проверять обновления приложения при запуске.
+    pub auto_update_check: bool,
+    /// Открытый раздел: "maps" | "scanner" | "raids" | "settings".
     pub section: String,
     /// Выбранная карта (id из maps.rs).
     pub map: String,
@@ -86,6 +88,7 @@ impl Default for Settings {
             show_rooms: true,
             show_extracts: true,
             auto_refresh: true,
+            auto_update_check: true,
             section: "maps".into(),
             map: "the-lab".into(),
             scanner: ScannerSettings::default(),

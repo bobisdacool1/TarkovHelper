@@ -38,10 +38,15 @@ enum Section {
     Maps,
     Scanner,
     Raids,
+    Settings,
 }
 
 enum UpdateState {
     None,
+    /// Идёт ручная проверка.
+    Checking,
+    /// Ручная проверка: новой версии нет.
+    UpToDate,
     Available(std::sync::Arc<cargo_packager_updater::Update>),
     Installing(String),
     Failed(String),
@@ -77,6 +82,8 @@ pub struct HelperApp {
     show_extracts: bool,
     /// Автообновление цен: при старте, если данные старше часа, и каждые 30 минут.
     auto_refresh: bool,
+    /// Проверять обновления приложения при запуске.
+    auto_update_check: bool,
     /// Открытый раздел приложения.
     section: Section,
     /// Открыт список выбора карты.
@@ -84,6 +91,8 @@ pub struct HelperApp {
     scanner: settings::ScannerSettings,
     /// Идёт запись сочетания: Some(true) — сканирование, Some(false) — скрытие.
     recording: Option<bool>,
+    /// Подсказка, почему сочетание не записано (например, голая ПКМ).
+    hotkey_error: Option<&'static str>,
     hotkey_focus: FocusHandle,
     /// Журнал рейдов (общий с оверлеем после рейда).
     raid_log: Entity<crate::raid_overlay::RaidLog>,
@@ -204,13 +213,16 @@ impl HelperApp {
             show_rooms: st.show_rooms,
             show_extracts: st.show_extracts,
             auto_refresh: st.auto_refresh,
+            auto_update_check: st.auto_update_check,
             section: match st.section.as_str() {
                 "scanner" => Section::Scanner,
                 "raids" => Section::Raids,
+                "settings" => Section::Settings,
                 _ => Section::Maps,
             },
             map_menu_open: false,
             recording: None,
+            hotkey_error: None,
             hotkey_focus: cx.focus_handle(),
             preview_item: 0,
             raid_log,
@@ -230,17 +242,9 @@ impl HelperApp {
         };
         this.load(false, cx);
         // новая версия приложения?
-        cx.spawn(async move |this, cx| {
-            let found = cx.background_executor().spawn(async { crate::updater::check() }).await;
-            if let Ok(Some(update)) = found {
-                this.update(cx, |this, cx| {
-                    this.update = UpdateState::Available(std::sync::Arc::new(update));
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
+        if this.auto_update_check {
+            this.check_updates(false, cx);
+        }
         // фоновое автообновление цен
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(std::time::Duration::from_secs(30 * 60)).await;
@@ -257,7 +261,40 @@ impl HelperApp {
         this
     }
 
+    /// Проверка обновлений: `manual` — по кнопке (показываем и «актуально», и ошибки).
+    fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if matches!(self.update, UpdateState::Checking | UpdateState::Installing(_)) {
+            return;
+        }
+        if manual {
+            self.update = UpdateState::Checking;
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { if manual { crate::updater::check_now() } else { crate::updater::check() } })
+                .await;
+            this.update(cx, |this, cx| {
+                this.update = match found {
+                    Ok(Some(update)) => UpdateState::Available(std::sync::Arc::new(update)),
+                    Ok(None) if manual => UpdateState::UpToDate,
+                    Err(e) if manual => UpdateState::Failed(format!("{e:#}")),
+                    _ => UpdateState::None,
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn install_update(&mut self, cx: &mut Context<Self>) {
+        if !crate::updater::can_install() {
+            self.update = UpdateState::Failed("в dev-сборке обновление не ставится — скачай релиз".into());
+            cx.notify();
+            return;
+        }
         let UpdateState::Available(update) = &self.update else { return };
         let update = update.clone();
         self.update = UpdateState::Installing(update.version.clone());
@@ -294,10 +331,12 @@ impl HelperApp {
             show_rooms: self.show_rooms,
             show_extracts: self.show_extracts,
             auto_refresh: self.auto_refresh,
+            auto_update_check: self.auto_update_check,
             section: match self.section {
                 Section::Maps => "maps",
                 Section::Scanner => "scanner",
                 Section::Raids => "raids",
+                Section::Settings => "settings",
             }
             .into(),
             map: "the-lab".into(),
@@ -492,10 +531,35 @@ impl HelperApp {
         floor as f32 * (w + FLOOR_GAP)
     }
 
+    /// Переключает этажи, сохраняя зум и место на карте под центром окна.
     fn set_floor_view(&mut self, view: Option<usize>, cx: &mut Context<Self>) {
-        self.floor_view = view;
         self.hover = None;
-        self.fit();
+        let bounds = *self.map_bounds.borrow();
+        let (Some(b), Some(range), true) = (bounds, self.range, self.fitted) else {
+            // карта ещё не показана — просто вписываем
+            self.floor_view = view;
+            self.fit();
+            cx.notify();
+            return;
+        };
+        let (floor_w, _) = range.pixel_size();
+        let center = (f32::from(b.size.width) / 2.0, f32::from(b.size.height) / 2.0);
+        // точка карты под центром: этаж и координата внутри картинки этажа
+        let world_x = (center.0 - self.offset.0) / self.scale;
+        let world_y = (center.1 - self.offset.1) / self.scale;
+        let (from_floor, local_x) = match self.floor_view {
+            Some(f) => (f, world_x),
+            None => {
+                let step = floor_w + FLOOR_GAP;
+                let f = ((world_x / step).floor().max(0.0) as usize).min(FLOORS.len() - 1);
+                (f, world_x - f as f32 * step)
+            }
+        };
+        self.floor_view = view;
+        // на «Все этажи» остаёмся на том же этаже, на одиночном — то же место на выбранном
+        let to_floor = view.unwrap_or(from_floor);
+        let new_world_x = self.floor_origin(to_floor) + local_x;
+        self.offset = (center.0 - new_world_x * self.scale, center.1 - world_y * self.scale);
         cx.notify();
     }
 
@@ -1271,7 +1335,7 @@ impl HelperApp {
         };
         col = col.child(status.text_xs().mt_2());
         match &self.update {
-            UpdateState::None => {}
+            UpdateState::None | UpdateState::Checking | UpdateState::UpToDate => {}
             UpdateState::Available(u) => {
                 col = col.child(
                     div()
@@ -1751,6 +1815,7 @@ impl Render for HelperApp {
                 Section::Maps => root.child(self.render_sidebar(window, cx)).child(self.render_map(cx)),
                 Section::Scanner => root.child(self.render_scanner(cx)),
                 Section::Raids => root.child(self.render_raids(cx)),
+                Section::Settings => root.child(self.render_settings(cx)),
             })
     }
 }
@@ -1801,6 +1866,8 @@ impl HelperApp {
             .child(item("nav-maps", "🗺", "КАРТЫ", Section::Maps, self.section == Section::Maps, cx))
             .child(item("nav-scanner", "🔍", "СКАНЕР", Section::Scanner, self.section == Section::Scanner, cx))
             .child(item("nav-raids", "📊", "РЕЙДЫ", Section::Raids, self.section == Section::Raids, cx))
+            .child(div().flex_1())
+            .child(item("nav-settings", "⚙", "НАСТРОЙКИ", Section::Settings, self.section == Section::Settings, cx))
     }
 
     /// Выпадающий список карт под заголовком.
@@ -1894,6 +1961,26 @@ impl HelperApp {
 
         div()
             .id("scanner-page")
+            .when(self.recording.is_some(), |el| {
+                // во время записи любой клик — это кандидат в сочетание, а не нажатие кнопок страницы
+                el.capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    let Some(is_scan) = this.recording else { return };
+                    cx.stop_propagation();
+                    match crate::hotkey::from_mouse(ev.button, &ev.modifiers) {
+                        Ok(new) => {
+                            this.assign_hotkey(is_scan, new);
+                            window.blur();
+                        }
+                        // обычный ЛКМ — отмена записи, как клик мимо поля
+                        Err(_) if ev.button == MouseButton::Left => {
+                            this.recording = None;
+                            window.blur();
+                        }
+                        Err(msg) => this.hotkey_error = Some(msg),
+                    }
+                    cx.notify();
+                }))
+            })
             .flex_1()
             .flex()
             .items_start()
@@ -1927,7 +2014,13 @@ impl HelperApp {
                             .mt_1()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("Нажми на поле и затем нужное сочетание: например Ctrl + Shift + F9 или Alt + Q. Esc — отмена."),
+                            .child("Нажми на поле, потом клавишу или кнопку мыши: Ctrl + Shift + F9, Alt + Q, Mouse 4, колесо. ЛКМ/ПКМ — только с Ctrl/Alt/Shift. Esc — отмена."),
+                    )
+                    .when_some(self.hotkey_error, |el, msg| {
+                        el.child(div().mt_1().text_xs().text_color(rgb(0xffb74d)).child(msg))
+                    })
+                    .child(
+                        div(),
                     )
                     .child(heading("ЧТО ПОКАЗЫВАТЬ"))
                     .child(toggle_row("sc-slot", "Цена за клетку", "Чтобы понять, стоит ли предмет места в рюкзаке", sc.show_per_slot, |s| s.show_per_slot = !s.show_per_slot, cx))
@@ -2049,6 +2142,7 @@ impl HelperApp {
             .hover(|s| s.border_color(rgb(GOLD)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.recording = Some(is_scan);
+                this.hotkey_error = None;
                 this.hotkey_focus.focus(window);
                 cx.notify();
             }))
@@ -2061,23 +2155,12 @@ impl HelperApp {
                             this.recording = None;
                             window.blur();
                         } else if let Some(new) = crate::hotkey::from_keystroke(k) {
-                            let sc = &mut this.scanner;
-                            let (mine, other) =
-                                if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
-                            if other.eq_ignore_ascii_case(&new) {
-                                *other = mine.clone();
-                            }
-                            *mine = new;
-                            this.recording = None;
+                            this.assign_hotkey(is_scan, new);
                             window.blur();
                         } else {
                             return; // только модификатор — ждём основную клавишу
                         }
                         cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.recording = None;
                         cx.notify();
                     }))
             })
@@ -2495,5 +2578,179 @@ impl HelperApp {
                     .child(heading("ИСТОРИЯ"))
                     .children(history),
             )
+    }
+}
+
+impl HelperApp {
+    /// Общие настройки приложения.
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let heading = |t: &'static str| div().mt_6().mb_2().text_sm().text_color(rgb(GOLD)).child(t);
+        let row = |label: &'static str, hint: String| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .py(px(8.0))
+                .border_b_1()
+                .border_color(rgb(0x2a2824))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().child(label))
+                        .when(!hint.is_empty(), |el| el.child(div().text_xs().text_color(rgb(MUTED)).child(hint))),
+                )
+        };
+        let button = |id: &'static str, label: String, primary: bool| {
+            div()
+                .id(id)
+                .flex_none()
+                .px_3()
+                .py_1()
+                .border_1()
+                .border_color(rgb(if primary { GOLD } else { GOLD_DIM }))
+                .bg(rgb(if primary { GOLD } else { PANEL }))
+                .text_color(rgb(if primary { 0x1a1a1a } else { TEXT }))
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.9))
+                .child(label)
+        };
+        let toggle = |id: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex_none()
+                .w(px(40.0))
+                .h(px(22.0))
+                .p(px(2.0))
+                .rounded_full()
+                .cursor_pointer()
+                .bg(rgb(if on { GOLD } else { 0x3a372f }))
+                .flex()
+                .when(on, |el| el.justify_end())
+                .child(div().size(px(18.0)).rounded_full().bg(rgb(if on { 0x1a1a1a } else { MUTED })))
+        };
+
+        // статус обновления
+        let (status_text, status_color): (String, u32) = match &self.update {
+            UpdateState::None => ("Нажми, чтобы проверить".into(), MUTED),
+            UpdateState::Checking => ("Проверяю…".into(), GOLD),
+            UpdateState::UpToDate => ("У тебя последняя версия".into(), 0x7cb342),
+            UpdateState::Available(u) => (format!("Доступна версия {}", u.version), GOLD),
+            UpdateState::Installing(v) => (format!("Ставлю {v}… приложение перезапустится"), GOLD),
+            UpdateState::Failed(e) => (format!("Не получилось: {e}"), 0xff6b6b),
+        };
+        let update_button = match &self.update {
+            UpdateState::Available(_) => button("st-install", "Обновить".into(), true)
+                .on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+                .into_any_element(),
+            UpdateState::Checking | UpdateState::Installing(_) => div().into_any_element(),
+            _ => button("st-check", "Проверить обновления".into(), false)
+                .on_click(cx.listener(|this, _, _, cx| this.check_updates(true, cx)))
+                .into_any_element(),
+        };
+
+        let fetched = self.data.as_ref().and_then(|d| d.fetched_at).map(|t| {
+            chrono::DateTime::from_timestamp(t as i64, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%d.%m %H:%M").to_string())
+                .unwrap_or_default()
+        });
+        let data_dir = data::data_dir();
+        let build = if cfg!(debug_assertions) { "dev-сборка" } else { "релиз" };
+
+        div()
+            .id("settings-page")
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .max_w(px(720.0))
+                    .px(px(32.0))
+                    .py(px(24.0))
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child("НАСТРОЙКИ"))
+                    // --- приложение ---
+                    .child(heading("ПРИЛОЖЕНИЕ"))
+                    .child(
+                        row("Tarkov Helper", format!("версия {} · {build}", env!("CARGO_PKG_VERSION")))
+                            .child(div().flex().items_center().gap_3().child(div().text_sm().text_color(rgb(status_color)).child(status_text)).child(update_button)),
+                    )
+                    .child(
+                        row("Проверять обновления при запуске", "Если выйдет новая версия, в меню появится кнопка «Обновить»".into())
+                            .child(toggle("st-autoupd", self.auto_update_check).on_click(cx.listener(|this, _, _, cx| {
+                                this.auto_update_check = !this.auto_update_check;
+                                cx.notify();
+                            }))),
+                    )
+                    // --- данные ---
+                    .child(heading("ДАННЫЕ И ЦЕНЫ"))
+                    .child(
+                        row("Режим игры", "От режима зависят цены и данные карт".into()).child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(segmented("st-pve", "PvE", self.mode == Mode::Pve, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pve, cx))))
+                                .child(segmented("st-pvp", "PvP", self.mode == Mode::Pvp, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pvp, cx)))),
+                        ),
+                    )
+                    .child(
+                        row("Автообновление цен", "При запуске, если данным больше часа, и каждые 30 минут".into())
+                            .child(toggle("st-autoref", self.auto_refresh).on_click(cx.listener(|this, _, _, cx| {
+                                this.auto_refresh = !this.auto_refresh;
+                                cx.notify();
+                            }))),
+                    )
+                    .child(
+                        row(
+                            "Цены",
+                            match (&self.status, fetched) {
+                                (Status::Busy(s), _) => s.clone(),
+                                (_, Some(t)) => format!("обновлены {t} · источник tarkov.dev"),
+                                _ => "ещё не загружены".into(),
+                            },
+                        )
+                        .child(button("st-refresh", "Обновить сейчас".into(), false).on_click(cx.listener(|this, _, _, cx| {
+                            if !matches!(this.status, Status::Busy(_)) {
+                                this.load(true, cx);
+                            }
+                        }))),
+                    )
+                    .child(
+                        row("Папка с данными", data_dir.display().to_string()).child(
+                            button("st-folder", if cfg!(target_os = "macos") { "Показать в Finder" } else { "Открыть папку" }.into(), false)
+                                .on_click(move |_, _, cx| cx.reveal_path(&data_dir)),
+                        ),
+                    )
+                    // --- ссылки ---
+                    .child(heading("ССЫЛКИ"))
+                    .child(
+                        row("Исходный код и релизы", format!("github.com/{}", crate::updater::REPO)).child(
+                            button("st-github", "Открыть GitHub".into(), false)
+                                .on_click(|_, _, cx| cx.open_url(&format!("https://github.com/{}", crate::updater::REPO))),
+                        ),
+                    )
+                    .child(
+                        row("Данные о предметах и картах", "tarkov.dev — открытые данные сообщества".into())
+                            .child(button("st-tdev", "tarkov.dev".into(), false).on_click(|_, _, cx| cx.open_url("https://tarkov.dev"))),
+                    ),
+            )
+    }
+}
+
+impl HelperApp {
+    /// Назначить сочетание сканированию или скрытию; занятое другим действием — поменять местами.
+    fn assign_hotkey(&mut self, is_scan: bool, new: String) {
+        let sc = &mut self.scanner;
+        let (mine, other) = if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
+        if other.eq_ignore_ascii_case(&new) {
+            *other = mine.clone();
+        }
+        *mine = new;
+        self.recording = None;
+        self.hotkey_error = None;
     }
 }
