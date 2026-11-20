@@ -1,5 +1,5 @@
 //! Оверлей после рейда: распознанный рюкзак → исключить лишнее → выбрать карту → подтвердить.
-//! Пока открывается с примером; позже его будет открывать хоткей сканера (Windows).
+//! Открывается хоткеем сканера (скан рюкзака под курсором, Windows) или с примером со страницы рейдов.
 //! Висит всегда, пока не подтвердишь или не отменишь: настройки удержания, таймера и
 //! скрытия при движении мыши из `ScannerSettings` на него не действуют.
 
@@ -107,6 +107,12 @@ pub fn open(rows: Vec<Detected>, mode: String, log: Entity<RaidLog>, sample: boo
     );
     if let Ok(handle) = handle {
         let _ = handle.update(cx, |_, window, _| keep_visible(window));
+        // Windows: PopUp у GPUI не «поверх всех» — без этого окно уйдёт под игру.
+        // Win32-вызов — вне обновления окна, в следующем такте.
+        #[cfg(windows)]
+        if let Ok(Some(hwnd)) = handle.update(cx, |_, window, _| crate::scanner::win::window_hwnd(window)) {
+            cx.spawn(async move |_| crate::scanner::win::set_topmost(hwnd)).detach();
+        }
     }
 }
 
@@ -143,7 +149,7 @@ fn keep_visible(window: &Window) {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = window; // Windows: «поверх всех окон» добавим вместе со сканером
+    let _ = window; // Windows: «поверх всех окон» ставит `open` через scanner::win::set_topmost
 }
 
 impl RaidOverlay {

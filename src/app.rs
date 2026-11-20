@@ -41,6 +41,42 @@ enum Section {
     Settings,
 }
 
+/// Сочетания сканера.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyRole {
+    Scan,
+    Hide,
+    Raid,
+}
+
+impl KeyRole {
+    const ALL: [KeyRole; 3] = [KeyRole::Scan, KeyRole::Hide, KeyRole::Raid];
+
+    fn default_key(self) -> &'static str {
+        match self {
+            KeyRole::Scan => "f9",
+            KeyRole::Hide => "f10",
+            KeyRole::Raid => "f8",
+        }
+    }
+
+    fn reset_id(self) -> &'static str {
+        match self {
+            KeyRole::Scan => "hk-scan-reset",
+            KeyRole::Hide => "hk-hide-reset",
+            KeyRole::Raid => "hk-raid-reset",
+        }
+    }
+
+    fn key(self, sc: &mut settings::ScannerSettings) -> &mut String {
+        match self {
+            KeyRole::Scan => &mut sc.scan_key,
+            KeyRole::Hide => &mut sc.hide_key,
+            KeyRole::Raid => &mut sc.raid_key,
+        }
+    }
+}
+
 enum UpdateState {
     None,
     /// Идёт ручная проверка.
@@ -89,13 +125,15 @@ pub struct HelperApp {
     /// Открыт список выбора карты.
     map_menu_open: bool,
     scanner: settings::ScannerSettings,
-    /// Идёт запись сочетания: Some(true) — сканирование, Some(false) — скрытие.
-    recording: Option<bool>,
+    /// Какое сочетание сканера сейчас записывается.
+    recording: Option<KeyRole>,
     /// Подсказка, почему сочетание не записано (например, голая ПКМ).
     hotkey_error: Option<&'static str>,
     hotkey_focus: FocusHandle,
     /// Журнал рейдов (общий с оверлеем после рейда).
     raid_log: Entity<crate::raid_overlay::RaidLog>,
+    /// Сканер цен: хуки, карточка поверх игры, итог последнего скана.
+    scanner_rt: Entity<crate::scanner::Scanner>,
     /// Фильтр статистики рейдов по режиму: None — все.
     raids_mode: Option<&'static str>,
     /// Раскрытый рейд в истории.
@@ -190,6 +228,8 @@ impl HelperApp {
         let st = settings::load();
         let raid_log = cx.new(|_| crate::raid_overlay::RaidLog::load());
         cx.observe(&raid_log, |_, _, cx| cx.notify()).detach();
+        let scanner_rt = cx.new(|cx| crate::scanner::Scanner::new(st.scanner.clone(), raid_log.clone(), cx));
+        cx.observe(&scanner_rt, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
             mode: if st.mode == "pvp" { Mode::Pvp } else { Mode::Pve },
             status: Status::Idle,
@@ -226,6 +266,7 @@ impl HelperApp {
             hotkey_focus: cx.focus_handle(),
             preview_item: 0,
             raid_log,
+            scanner_rt,
             raids_mode: None,
             open_raid: None,
             scanner: st.scanner.clone(),
@@ -1805,6 +1846,9 @@ pub(crate) fn link(
 impl Render for HelperApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.persist();
+        let (sc, data, recording) = (self.scanner.clone(), self.data.clone(), self.recording.is_some());
+        let mode = if self.mode == Mode::Pvp { "pvp" } else { "pve" };
+        self.scanner_rt.update(cx, |s, _| s.sync(&sc, data, mode, recording));
         div()
             .flex()
             .size_full()
@@ -1935,26 +1979,46 @@ impl HelperApp {
         };
         let heading = |t: &'static str| div().mt_6().mb_2().text_sm().text_color(rgb(GOLD)).child(t);
 
+        let rt = self.scanner_rt.read(cx);
+        let keys = |k: &str| crate::hotkey::display(k).join(" + ");
+        let (title, body, warn): (String, String, bool) = if !supported {
+            (
+                "Сканер работает только на Windows".into(),
+                "Игра запускается только на Windows, поэтому сканер будет там. Здесь можно заранее настроить, что он будет показывать.".into(),
+                true,
+            )
+        } else if !sc.enabled {
+            ("Сканер выключен".into(), "Включи его ниже — клавиши начнут работать сразу.".into(), true)
+        } else if rt.languages.as_ref().is_some_and(|l| l.is_empty()) {
+            ("Нет языка распознавания текста".into(), crate::scanner::NO_OCR.into(), true)
+        } else {
+            let langs = rt.languages.as_ref().map(|l| l.join(", ")).unwrap_or_else(|| "…".into());
+            (
+                "Сканер работает".into(),
+                format!(
+                    "{} — цена предмета под курсором, {} — рюкзак после рейда{}. Распознавание: {langs}.",
+                    keys(&sc.scan_key),
+                    keys(&sc.raid_key),
+                    if sc.only_in_game { ", только в окне игры" } else { "" }
+                ),
+                false,
+            )
+        };
+        let last = rt.status.clone();
         let status_card = div()
             .mt_4()
             .p_3()
             .border_1()
-            .border_color(rgb(if supported { GOLD_DIM } else { 0x7a5a2a }))
+            .border_color(rgb(if warn { 0x7a5a2a } else { GOLD_DIM }))
             .bg(rgb(CARD))
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(if supported { GOLD } else { 0xffb74d }))
-                    .child(if supported { "Сканер в разработке" } else { "Сканер работает только на Windows" }),
-            )
-            .child(div().text_sm().text_color(rgb(MUTED)).child(if supported {
-                "Настройки уже сохраняются — сам сканер появится в одном из следующих обновлений."
-            } else {
-                "Игра запускается только на Windows, поэтому сканер будет там. Здесь можно заранее настроить, что он будет показывать."
-            }));
+            .child(div().font_weight(FontWeight::BOLD).text_color(rgb(if warn { 0xffb74d } else { GOLD })).child(title))
+            .child(div().text_sm().text_color(rgb(MUTED)).child(body))
+            .when_some(last.filter(|_| supported), |el, (ok, text)| {
+                el.child(div().mt_1().text_sm().text_color(rgb(if ok { TEXT } else { 0xffb74d })).child(text))
+            });
 
         let seconds: [(u32, &'static str); 4] = [(3, "3 с"), (5, "5 с"), (10, "10 с"), (0, "пока не скрою")];
         let positions: [(&'static str, &'static str); 2] = [("cursor", "у курсора"), ("corner", "в углу экрана")];
@@ -1964,11 +2028,11 @@ impl HelperApp {
             .when(self.recording.is_some(), |el| {
                 // во время записи любой клик — это кандидат в сочетание, а не нажатие кнопок страницы
                 el.capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    let Some(is_scan) = this.recording else { return };
+                    let Some(role) = this.recording else { return };
                     cx.stop_propagation();
                     match crate::hotkey::from_mouse(ev.button, &ev.modifiers) {
                         Ok(new) => {
-                            this.assign_hotkey(is_scan, new);
+                            this.assign_hotkey(role, new);
                             window.blur();
                         }
                         // обычный ЛКМ — отмена записи, как клик мимо поля
@@ -2001,14 +2065,16 @@ impl HelperApp {
                             .mt_1()
                             .text_sm()
                             .text_color(rgb(MUTED))
-                            .child("Наведи курсор на предмет в игре и нажми клавишу — рядом появится его цена."),
+                            .child("Наведи курсор на предмет в игре и нажми клавишу — рядом появится его цена. Вторая клавиша считает весь рюкзак под курсором и открывает «После рейда»."),
                     )
                     .child(status_card)
                     .child(heading("ОСНОВНОЕ"))
                     .child(toggle_row("sc-enabled", "Включить сканер", "Сканер слушает горячую клавишу, пока открыт Tarkov Helper", sc.enabled, |s| s.enabled = !s.enabled, cx))
+                    .child(toggle_row("sc-game", "Только в окне игры", "Клавиши срабатывают, когда впереди Escape from Tarkov", sc.only_in_game, |s| s.only_in_game = !s.only_in_game, cx))
                     .child(heading("ГОРЯЧИЕ КЛАВИШИ"))
-                    .child(self.hotkey_field("hk-scan", "Сканировать предмет под курсором", &sc.scan_key, true, cx))
-                    .child(self.hotkey_field("hk-hide", "Скрыть оверлей", &sc.hide_key, false, cx))
+                    .child(self.hotkey_field("hk-scan", "Цена предмета под курсором", &sc.scan_key, KeyRole::Scan, cx))
+                    .child(self.hotkey_field("hk-hide", "Скрыть оверлей", &sc.hide_key, KeyRole::Hide, cx))
+                    .child(self.hotkey_field("hk-raid", "Рюкзак после рейда", &sc.raid_key, KeyRole::Raid, cx))
                     .child(
                         div()
                             .mt_1()
@@ -2080,6 +2146,15 @@ impl HelperApp {
                             }),
                         )
                     })))
+                    .child(heading("ОТЛАДКА"))
+                    .child(toggle_row(
+                        "sc-debug",
+                        "Сохранять снимки сканов",
+                        "Папка scanner-debug в папке данных: снимок вокруг курсора, найденные квадраты и прочитанный текст",
+                        sc.debug_shots,
+                        |s| s.debug_shots = !s.debug_shots,
+                        cx,
+                    ))
                     .child(heading("КАК ЭТО РАБОТАЕТ"))
                     .child(
                         div()
@@ -2105,11 +2180,11 @@ impl HelperApp {
         id: &'static str,
         label: &'static str,
         combo: &str,
-        is_scan: bool,
+        role: KeyRole,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let recording = self.recording == Some(is_scan);
-        let default = if is_scan { "f9" } else { "f10" };
+        let recording = self.recording == Some(role);
+        let default = role.default_key();
         let is_default = combo.eq_ignore_ascii_case(default);
         let keycap = |k: String| {
             div()
@@ -2141,7 +2216,7 @@ impl HelperApp {
             .cursor_pointer()
             .hover(|s| s.border_color(rgb(GOLD)))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.recording = Some(is_scan);
+                this.recording = Some(role);
                 this.hotkey_error = None;
                 this.hotkey_focus.focus(window);
                 cx.notify();
@@ -2155,7 +2230,7 @@ impl HelperApp {
                             this.recording = None;
                             window.blur();
                         } else if let Some(new) = crate::hotkey::from_keystroke(k) {
-                            this.assign_hotkey(is_scan, new);
+                            this.assign_hotkey(role, new);
                             window.blur();
                         } else {
                             return; // только модификатор — ждём основную клавишу
@@ -2191,17 +2266,10 @@ impl HelperApp {
             .child(field)
             .when(!is_default && !recording, |el| {
                 el.child(link(
-                    if is_scan { "hk-scan-reset" } else { "hk-hide-reset" },
+                    role.reset_id(),
                     "по умолчанию",
                     cx.listener(move |this, _, _, cx| {
-                        let sc = &mut this.scanner;
-                        let (mine, other) =
-                            if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
-                        let new = default.to_string();
-                        if other.eq_ignore_ascii_case(&new) {
-                            *other = mine.clone();
-                        }
-                        *mine = new;
+                        this.assign_hotkey(role, default.to_string());
                         cx.notify();
                     }),
                 ))
@@ -2230,88 +2298,9 @@ impl HelperApp {
         };
         let sc = &self.scanner;
 
-        // строки оверлея по настройкам
-        let row = |label: String, value: String, color: u32| {
-            div()
-                .flex()
-                .justify_between()
-                .gap_4()
-                .text_sm()
-                .child(div().text_color(rgb(MUTED)).child(label))
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color)).child(value))
-        };
-        let mut rows: Vec<AnyElement> = Vec::new();
-        if sc.show_per_slot {
-            rows.push(
-                row(
-                    format!("За клетку ({}×{})", item.width, item.height),
-                    fmt_rub(item.price() / item.slots() as i64),
-                    tier_color(item.price() / item.slots() as i64),
-                )
-                .into_any_element(),
-            );
-        }
-        if sc.show_flea {
-            let v = if item.flea > 0 { fmt_rub(item.flea) } else { "нельзя продать".into() };
-            rows.push(row("Барахолка".into(), v, TEXT).into_any_element());
-        }
-        if sc.show_trader && item.trader > 0 {
-            rows.push(row(item.trader_name.to_string(), fmt_rub(item.trader), TEXT).into_any_element());
-        }
-        if sc.show_needed {
-            let needs = d.needs.get(item_id).cloned().unwrap_or_default();
-            if needs.is_empty() {
-                rows.push(div().text_xs().text_color(rgb(MUTED)).child("Не нужен для убежища и задач").into_any_element());
-            } else {
-                rows.push(div().mt_1().text_xs().text_color(rgb(GOLD)).child("НУЖЕН").into_any_element());
-                for n in needs.iter().take(4) {
-                    rows.push(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .text_xs()
-                            .child(div().child(if n.hideout { "🏠" } else { "📜" }))
-                            .child(div().flex_1().text_color(rgb(TEXT)).child(n.name.clone()))
-                            .child(
-                                div()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("×{}{}", n.count, if n.found_in_raid { " · FIR" } else { "" })),
-                            )
-                            .into_any_element(),
-                    );
-                }
-                if needs.len() > 4 {
-                    rows.push(
-                        div().text_xs().text_color(rgb(MUTED)).child(format!("и ещё {}", needs.len() - 4)).into_any_element(),
-                    );
-                }
-            }
-        }
-        if rows.is_empty() {
-            rows.push(div().text_sm().text_color(rgb(MUTED)).child("Ничего не выбрано для показа").into_any_element());
-        }
-        let footer = if sc.hold_to_show {
-            format!("пока держишь {}", crate::hotkey::display(&sc.scan_key).join(" + "))
-        } else if sc.show_seconds == 0 {
-            format!("{} — скрыть", crate::hotkey::display(&sc.hide_key).join(" + "))
-        } else {
-            format!("скроется через {} с · {} — скрыть", sc.show_seconds, crate::hotkey::display(&sc.hide_key).join(" + "))
-        };
-        let card = div()
-            .w(px(280.0))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_3()
-            .bg(with_alpha(0x15140f, 0xf2))
-            .border_1()
-            .border_color(rgb(GOLD))
-            .shadow_lg()
-            .text_color(rgb(TEXT))
-            .child(div().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child(item.short.clone()))
-            .child(div().text_xs().text_color(rgb(MUTED)).mb_1().child(item.name.clone()))
-            .children(rows)
-            .child(div().mt_2().text_xs().text_color(rgb(MUTED)).child(footer));
+        let needs = d.needs.get(item_id).cloned().unwrap_or_default();
+        let footer = crate::scanner::card::footer_text(sc);
+        let card = crate::scanner::card::price_card(&item, &needs, 0, sc, &footer).0.shadow_lg();
 
         // макет экрана: сетка инвентаря, предмет под курсором, оверлей
         const CELL: f32 = 48.0;
@@ -2743,13 +2732,16 @@ impl HelperApp {
 
 impl HelperApp {
     /// Назначить сочетание сканированию или скрытию; занятое другим действием — поменять местами.
-    fn assign_hotkey(&mut self, is_scan: bool, new: String) {
+    /// Записывает сочетание; если оно уже занято другим действием — меняет их местами.
+    fn assign_hotkey(&mut self, role: KeyRole, new: String) {
         let sc = &mut self.scanner;
-        let (mine, other) = if is_scan { (&mut sc.scan_key, &mut sc.hide_key) } else { (&mut sc.hide_key, &mut sc.scan_key) };
-        if other.eq_ignore_ascii_case(&new) {
-            *other = mine.clone();
+        let old = role.key(sc).clone();
+        for other in KeyRole::ALL.into_iter().filter(|r| *r != role) {
+            if other.key(sc).eq_ignore_ascii_case(&new) {
+                *other.key(sc) = old.clone();
+            }
         }
-        *mine = new;
+        *role.key(sc) = new;
         self.recording = None;
         self.hotkey_error = None;
     }

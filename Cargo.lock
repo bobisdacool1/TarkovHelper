@@ -5506,6 +5506,7 @@ dependencies = [
  "chrono",
  "dirs 7.0.0",
  "embed-resource",
+ "futures",
  "gpui",
  "image",
  "objc",
@@ -5515,6 +5516,7 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "ureq",
+ "windows 0.61.3",
 ]
 
 [[package]]

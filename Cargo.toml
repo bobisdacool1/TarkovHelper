@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 cargo-packager-updater = "0.2.3"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
+futures = "0.3"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 raw-window-handle = "0.6"
@@ -23,6 +24,26 @@ ureq = "2"
 # свой код остаётся быстро собираемым.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Сканер цен: снимок экрана, OCR (Windows.Media.Ocr), глобальные хуки, окна поверх игры.
+# Та же версия, что у GPUI, — не собирается второй раз.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"

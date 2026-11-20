@@ -6,6 +6,7 @@ mod labs;
 mod maps;
 mod raid_overlay;
 mod raids;
+mod scanner;
 mod settings;
 mod text_input;
 mod tiles;
@@ -39,6 +40,9 @@ impl gpui::AssetSource for Assets {
 }
 
 fn main() {
+    // сканеру нужны физические пиксели: снимок экрана, курсор и окна поверх игры в одних координатах
+    #[cfg(windows)]
+    scanner::win::make_dpi_aware();
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

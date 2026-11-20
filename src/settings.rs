@@ -40,6 +40,12 @@ pub struct ScannerSettings {
     pub scan_key: String,
     /// Клавиша скрытия оверлея.
     pub hide_key: String,
+    /// Скан всего контейнера под курсором → окно «После рейда».
+    pub raid_key: String,
+    /// Реагировать на клавиши, только когда впереди окно игры.
+    pub only_in_game: bool,
+    /// Сохранять снимки сканов в папку данных — для отладки распознавания.
+    pub debug_shots: bool,
     pub show_flea: bool,
     pub show_trader: bool,
     pub show_per_slot: bool,
@@ -61,6 +67,9 @@ impl Default for ScannerSettings {
             enabled: false,
             scan_key: "F9".into(),
             hide_key: "F10".into(),
+            raid_key: "F8".into(),
+            only_in_game: true,
+            debug_shots: false,
             show_flea: true,
             show_trader: true,
             show_per_slot: true,
