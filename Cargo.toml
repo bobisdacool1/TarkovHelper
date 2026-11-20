@@ -33,8 +33,7 @@ product-name = "Tarkov Helper"
 identifier = "io.github.bobisdacool1.tarkovhelper"
 category = "Utility"
 copyright = "bobisdacool1"
-before-packaging-command = "cargo build --release"
-icons = ["assets/icon.png"]
+icons = ["assets/app-icon/*.png"]
 out-dir = "dist"
 
 [package.metadata.packager.macos]

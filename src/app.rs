@@ -278,6 +278,7 @@ impl HelperApp {
             "Загрузка…".into()
         });
         cx.notify();
+        let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -299,6 +300,12 @@ impl HelperApp {
                 let mut refresh_after = false;
                 match result {
                     Ok((lab, range, images)) if lab.mode == this.mode => {
+                        eprintln!(
+                            "tarkov-helper: данные {} ({}) за {} мс",
+                            mode.label(),
+                            if need_download { "скачаны" } else { "из кэша" },
+                            started.elapsed().as_millis()
+                        );
                         let stale = lab.fetched_at.is_none_or(|t| {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
