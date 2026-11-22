@@ -1,3 +1,7 @@
+// Windows: релиз — оконное приложение, без чёрного окна консоли рядом. В debug консоль остаётся,
+// чтобы у `cargo run` был виден вывод.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod categories;
 mod data;

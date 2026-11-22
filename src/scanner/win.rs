@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context as _, Result};
@@ -22,13 +22,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, MapVirtualKeyW, MAPVK_VK_TO_CHAR};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
+    CallNextHookEx, CallWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
     PeekMessageW, PostThreadMessageW, SetWindowDisplayAffinity, SetWindowLongPtrW,
     SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, GWL_EXSTYLE, HC_ACTION, HHOOK,
     HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    WM_SYSKEYUP, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WINDOWPOS, WNDPROC, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST, GWLP_WNDPROC,
 };
 
 use super::HotkeyEvent;
@@ -487,16 +488,48 @@ pub fn prepare_card(h: isize) {
         SetWindowLongPtrW(hwnd(h), GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE | WS_EX_TOPMOST).0 as isize);
         let _ = SetWindowDisplayAffinity(hwnd(h), WDA_EXCLUDEFROMCAPTURE);
     }
+    keep_hidden_unless_shown(h);
+}
+
+/// Карточка спрятана — показать её может только `show_at`.
+static CARD_HIDDEN: AtomicBool = AtomicBool::new(true);
+/// Оконная процедура GPUI, которую оборачивает `card_proc`.
+static CARD_PREV_PROC: AtomicIsize = AtomicIsize::new(0);
+
+/// Карточка между сканами не закрывается, а прячется. GPUI сам показывает окно, когда «отключился»
+/// его монитор (`WM_DISPLAYCHANGE` → `ShowWindow(SW_SHOWNORMAL)`) — а монитор отключается при
+/// блокировке экрана и сне, и после разблокировки на рабочем столе всплывала старая карточка.
+/// Поэтому, пока карточка спрятана, снимаем флаг показа с любой попытки показать окно.
+fn keep_hidden_unless_shown(h: isize) {
+    if CARD_PREV_PROC.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    unsafe {
+        let prev = SetWindowLongPtrW(hwnd(h), GWLP_WNDPROC, card_proc as *const () as isize);
+        CARD_PREV_PROC.store(prev, Ordering::SeqCst);
+    }
+}
+
+unsafe extern "system" fn card_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_WINDOWPOSCHANGING && CARD_HIDDEN.load(Ordering::SeqCst) && lp.0 != 0 {
+        let pos = unsafe { &mut *(lp.0 as *mut WINDOWPOS) };
+        pos.flags &= !SWP_SHOWWINDOW;
+    }
+    // SAFETY: в CARD_PREV_PROC — оконная процедура GPUI, полученная от SetWindowLongPtrW
+    let prev: WNDPROC = unsafe { std::mem::transmute::<isize, WNDPROC>(CARD_PREV_PROC.load(Ordering::SeqCst)) };
+    unsafe { CallWindowProcW(prev, h, msg, wp, lp) }
 }
 
 /// Показать окно в точке экрана (физические пиксели) поверх всех, не активируя.
 pub fn show_at(h: isize, x: i32, y: i32, w: i32, height: i32) {
+    CARD_HIDDEN.store(false, Ordering::SeqCst);
     unsafe {
         let _ = SetWindowPos(hwnd(h), Some(HWND_TOPMOST), x, y, w, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }
 
 pub fn hide(h: isize) {
+    CARD_HIDDEN.store(true, Ordering::SeqCst);
     unsafe {
         let _ = ShowWindow(hwnd(h), SW_HIDE);
     }
@@ -513,5 +546,65 @@ pub fn make_dpi_aware() {
     use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, RegisterClassW, SW_SHOWNORMAL, WINDOW_EX_STYLE,
+        WNDCLASSW, WS_POPUP,
+    };
+
+    unsafe extern "system" fn plain_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(h, msg, wp, lp) }
+    }
+
+    /// Спрятанную карточку не показывает чужой `ShowWindow` (так GPUI реагирует на отключение
+    /// монитора при блокировке экрана), а `show_at` — показывает.
+    #[test]
+    fn hidden_card_stays_hidden() {
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(plain_proc),
+                hInstance: instance.into(),
+                lpszClassName: w!("TarkovHelperCardTest"),
+                ..Default::default()
+            };
+            RegisterClassW(&class);
+            let h = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("TarkovHelperCardTest"),
+                w!("card"),
+                WS_POPUP,
+                -2000,
+                -2000,
+                50,
+                50,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .unwrap();
+            let id = h.0 as isize;
+            prepare_card(id);
+            assert!(!IsWindowVisible(h).as_bool());
+
+            // как GPUI после разблокировки: окно спрятано, его пытаются показать
+            let _ = ShowWindow(h, SW_SHOWNORMAL);
+            assert!(!IsWindowVisible(h).as_bool(), "спрятанная карточка показалась");
+
+            show_at(id, -2000, -2000, 50, 50);
+            assert!(IsWindowVisible(h).as_bool(), "show_at не показал карточку");
+            hide(id);
+            assert!(!IsWindowVisible(h).as_bool());
+            let _ = ShowWindow(h, SW_SHOWNORMAL);
+            assert!(!IsWindowVisible(h).as_bool(), "после hide карточка снова показалась");
+            let _ = DestroyWindow(h);
+        }
     }
 }
