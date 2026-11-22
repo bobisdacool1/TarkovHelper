@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::categories;
 use crate::labs::{self, Pos, Room};
+use crate::lang::Lang;
 
 pub const USER_AGENT: &str = "tarkov-helper/0.1";
 
@@ -35,8 +36,8 @@ impl Mode {
 
 /// Файлы, которые качаем целиком (полный дамп режима).
 const DUMP_FILES: &[&str] = &[
-    "items", "items_ru", "items_en", "maps", "maps_ru", "traders", "barters", "crafts", "tasks", "tasks_ru",
-    "hideout", "hideout_ru",
+    "items", "items_ru", "items_en", "maps", "maps_ru", "maps_en", "traders", "barters", "crafts", "tasks",
+    "tasks_ru", "tasks_en", "hideout", "hideout_ru", "hideout_en",
 ];
 
 pub fn data_dir() -> PathBuf {
@@ -81,9 +82,16 @@ pub fn download_dump(mode: Mode) -> Result<()> {
     Ok(())
 }
 
+/// Дамп режима есть, и в нём есть переводы на текущем языке (в старом кэше английских
+/// переводов заданий и карт нет — тогда дамп докачается).
 pub fn has_dump(mode: Mode) -> bool {
     let dir = data_dir().join(mode.dir());
-    ["items", "items_ru", "maps"].iter().all(|f| dir.join(format!("{f}.json")).exists())
+    let l = crate::lang::get().code();
+    ["items", "maps"]
+        .iter()
+        .map(|f| f.to_string())
+        .chain(["items", "maps", "tasks", "hideout"].iter().map(|f| format!("{f}_{l}")))
+        .all(|f| dir.join(format!("{f}.json")).exists())
 }
 
 // ---------- сырые структуры json.tarkov.dev ----------
@@ -225,7 +233,7 @@ impl Item {
         self.flea.max(self.trader)
     }
     pub fn price_source(&self) -> &'static str {
-        if self.flea >= self.trader { "Барахолка" } else { self.trader_name }
+        if self.flea >= self.trader { crate::lang::pick("Барахолка", "Flea Market") } else { self.trader_name }
     }
 }
 
@@ -295,35 +303,30 @@ impl MapData {
     }
 }
 
-fn trader_name(id: &str) -> &'static str {
-    match id {
-        "54cb50c76803fa8b248b4571" => "Прапор",
-        "54cb57776803fa99248b456e" => "Терапевт",
-        "579dc571d53a0658a154fbec" => "Скупщик",
-        "58330581ace78e27b8b10cee" => "Лыжник",
-        "5935c25fb3acc3127c3d8cd9" => "Миротворец",
-        "5a7c2eca46aef81a7ca2145d" => "Механик",
-        "5ac3b934156ae10c4430e83c" => "Барахольщик",
-        "5c0647fdd443bc2504c2d371" => "Егерь",
-        "6617beeaa9cfa777ca915b7c" => "Реф",
-        _ => "Торговец",
-    }
-}
+use crate::tasks::trader_name;
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Читает кэш режима и собирает данные карты.
-pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
+/// Словарь переводов `<файл>_<язык>.json`; нет файла — пустой.
+fn translations(dir: &Path, file: &str, lang: Lang) -> HashMap<String, String> {
+    read_json::<Envelope<HashMap<String, String>>>(&dir.join(format!("{file}_{}.json", lang.code())))
+        .map(|e| e.data)
+        .unwrap_or_default()
+}
+
+/// Читает кэш режима и собирает данные карты; названия из игры — на языке `lang`.
+pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData> {
     let dir = data_dir().join(mode.dir());
     let items: Envelope<ItemsData> = read_json(&dir.join("items.json"))?;
-    let ru: Envelope<HashMap<String, String>> = read_json(&dir.join("items_ru.json"))?;
-    // английские имена — для поиска; файла может не быть в старом кэше
-    let en: HashMap<String, String> = read_json::<Envelope<HashMap<String, String>>>(&dir.join("items_en.json"))
-        .map(|e| e.data)
-        .unwrap_or_default();
+    let names: Envelope<HashMap<String, String>> =
+        read_json(&dir.join(format!("items_{}.json", lang.code())))?;
+    // английские имена — для поиска и сканера (ярлыки в игре могут быть на английском);
+    // при английских названиях русские остаются в поиске
+    let en = translations(&dir, "items", Lang::En);
+    let ru_search = if lang == Lang::En { translations(&dir, "items", Lang::Ru) } else { HashMap::new() };
     let maps: Envelope<MapsData> = read_json(&dir.join("maps.json"))?;
     let fetched_at = std::fs::read_to_string(dir.join("fetched_at")).ok().and_then(|s| s.trim().parse().ok());
 
@@ -340,12 +343,14 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
                 .iter()
                 .filter_map(|s| s.price_rub.map(|p| (p as i64, s.trader.as_str())))
                 .max_by_key(|(p, _)| *p);
-            let name = ru.data.get(&format!("{} Name", raw.id)).cloned().unwrap_or_else(|| raw.id.clone());
-            let short = ru.data.get(&format!("{} ShortName", raw.id)).cloned().unwrap_or_else(|| name.clone());
+            let name = names.data.get(&format!("{} Name", raw.id)).cloned().unwrap_or_else(|| raw.id.clone());
+            let short = names.data.get(&format!("{} ShortName", raw.id)).cloned().unwrap_or_else(|| name.clone());
             let cat = raw.categories.first().and_then(|c| cats.get(c)).map(|c| c.normalized_name.as_str());
             let en_name = en.get(&format!("{} Name", raw.id)).map(String::as_str).unwrap_or("");
             let en_short = en.get(&format!("{} ShortName", raw.id)).map(String::as_str).unwrap_or("");
-            let search = normalize(&format!("{name}|{short}|{en_name}|{en_short}"));
+            let ru_name = ru_search.get(&format!("{} Name", raw.id)).map(String::as_str).unwrap_or("");
+            let ru_short = ru_search.get(&format!("{} ShortName", raw.id)).map(String::as_str).unwrap_or("");
+            let search = normalize(&format!("{name}|{short}|{en_name}|{en_short}|{ru_name}|{ru_short}"));
             let item = Item {
                 id: raw.id.clone(),
                 name,
@@ -354,7 +359,7 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
                 name_en: en_name.to_string(),
                 flea,
                 trader: best.map(|b| b.0).unwrap_or(0),
-                trader_name: best.map(|b| trader_name(b.1)).unwrap_or(""),
+                trader_name: best.map(|b| trader_name(b.1, lang)).unwrap_or(""),
                 group: categories::group_of(cat),
                 width: raw.width.unwrap_or(1),
                 height: raw.height.unwrap_or(1),
@@ -366,7 +371,7 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
 
     let map_names: HashMap<String, String> =
         maps.data.maps.iter().map(|(id, m)| (id.clone(), m.normalized_name.clone())).collect();
-    let tasks = crate::tasks::load(&dir, &ru.data, &map_names);
+    let tasks = crate::tasks::load(&dir, &names.data, &map_names, lang);
     let lab = maps
         .data
         .maps
@@ -392,14 +397,12 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
         .filter_map(|l| Some(Lock { floor: floor_of(l.position), pos: l.position, key: l.key? }))
         .collect();
 
-    let maps_ru: HashMap<String, String> = read_json::<Envelope<HashMap<String, String>>>(&dir.join("maps_ru.json"))
-        .map(|e| e.data)
-        .unwrap_or_default();
+    let map_tr = translations(&dir, "maps", lang);
     let mut extracts: Vec<Extract> = lab
         .extracts
         .into_iter()
         .map(|e| Extract {
-            name: maps_ru.get(&e.name).cloned().unwrap_or(e.name),
+            name: map_tr.get(&e.name).cloned().unwrap_or(e.name),
             faction: e.faction,
             floor: floor_of(e.position),
             pos: e.position,
@@ -410,10 +413,10 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
         name: t
             .map
             .as_ref()
-            .and_then(|m| maps_ru.get(&format!("{m} Name")))
+            .and_then(|m| map_tr.get(&format!("{m} Name")))
             .map(|dest| format!("→ {dest}"))
-            .or_else(|| t.description.as_ref().and_then(|d| maps_ru.get(d)).cloned())
-            .unwrap_or_else(|| "Переход".into()),
+            .or_else(|| t.description.as_ref().and_then(|d| map_tr.get(d)).cloned())
+            .unwrap_or_else(|| lang.pick("Переход", "Transit").into()),
         faction: "transit".into(),
         floor: floor_of(t.position),
         pos: t.position,
@@ -430,7 +433,7 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
         .map(|s| Spawn { floor: floor_of(s.position), pos: s.position })
         .collect();
 
-    let needs = load_needs(&dir);
+    let needs = load_needs(&dir, lang);
 
     Ok(MapData { map, mode, fetched_at, items, loot, locks, extracts, spawns, rooms, needs, tasks })
 }
@@ -462,7 +465,7 @@ pub fn fmt_short(v: i64) -> String {
 }
 
 /// Требования убежища и задач по предметам. Файлов может не быть — тогда пусто.
-fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
+fn load_needs(dir: &Path, lang: Lang) -> HashMap<String, Vec<Need>> {
     use serde_json::Value;
     let read = |name: &str| -> Option<Value> {
         let v: Value = serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()?;
@@ -481,7 +484,7 @@ fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
     let mut needs: HashMap<String, Vec<Need>> = HashMap::new();
 
     if let Some(hideout) = read("hideout.json") {
-        let names = read("hideout_ru.json");
+        let names = read(&format!("hideout_{}.json", lang.code()));
         let stations = hideout.get("hideoutStations").cloned().unwrap_or(hideout);
         for st in values(&stations) {
             let station = tr(&names, st["name"].as_str().unwrap_or(""));
@@ -491,7 +494,7 @@ fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
                     let Some(item) = r["item"].as_str() else { continue };
                     needs.entry(item.to_string()).or_default().push(Need {
                         hideout: true,
-                        name: format!("{station}, ур. {level}"),
+                        name: format!("{station}, {} {level}", lang.pick("ур.", "lvl")),
                         count: r["count"].as_u64().unwrap_or(1) as u32,
                         found_in_raid: r["attributes"]["foundInRaid"].as_bool().unwrap_or(false),
                     });
@@ -501,7 +504,7 @@ fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
     }
 
     if let Some(tasks) = read("tasks.json") {
-        let names = read("tasks_ru.json");
+        let names = read(&format!("tasks_{}.json", lang.code()));
         let list = tasks.get("tasks").cloned().unwrap_or(tasks);
         for task in values(&list) {
             let name = tr(&names, task["name"].as_str().unwrap_or(""));
@@ -538,9 +541,27 @@ mod tests {
         if !has_dump(Mode::Pve) {
             return;
         }
-        let d = load_map(Mode::Pve, crate::maps::CUSTOMS).unwrap();
+        let d = load_map_in(Mode::Pve, crate::maps::CUSTOMS, Lang::Ru).unwrap();
         let names: Vec<&str> = d.extracts.iter().filter(|e| e.faction == "transit").map(|e| e.name.as_str()).collect();
         assert!(!names.is_empty());
         assert!(names.contains(&"→ Резерв"), "{names:?}");
+    }
+
+    /// На реальном кэше: на английском — названия заданий, предметов, переходов и торговцев
+    /// как в английском клиенте, а русские имена остаются в поиске.
+    #[test]
+    fn english_names() {
+        let dir = data_dir().join(Mode::Pve.dir());
+        if !["items_en", "tasks_en", "maps_en"].iter().all(|f| dir.join(format!("{f}.json")).exists()) {
+            return;
+        }
+        let d = load_map_in(Mode::Pve, crate::maps::CUSTOMS, Lang::En).unwrap();
+        let transits: Vec<&str> = d.extracts.iter().filter(|e| e.faction == "transit").map(|e| e.name.as_str()).collect();
+        assert!(transits.contains(&"→ Reserve"), "{transits:?}");
+        assert!(d.tasks.iter().any(|t| t.name == "Debut" && t.trader == "Prapor"));
+        let ledx = d.items.values().find(|i| i.short == "LEDX").expect("LEDX");
+        assert!(ledx.name.starts_with("LEDX Skin"), "{}", ledx.name);
+        // русские имена остаются в поиске
+        assert!(ledx.search.chars().any(|c| ('а'..='я').contains(&c)), "{}", ledx.search);
     }
 }

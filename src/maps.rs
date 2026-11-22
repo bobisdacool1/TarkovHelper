@@ -18,22 +18,31 @@ pub const ICEBREAKER: &str = "icebreaker";
 pub struct MapInfo {
     pub id: &'static str,
     pub name: &'static str,
+    /// Название в английском клиенте игры.
+    pub name_en: &'static str,
     pub available: bool,
 }
 
+impl MapInfo {
+    /// Название на языке названий из настроек.
+    pub fn title(&self) -> &'static str {
+        crate::lang::pick(self.name, self.name_en)
+    }
+}
+
 pub const MAPS: &[MapInfo] = &[
-    MapInfo { id: LAB, name: "Лаборатория", available: true },
-    MapInfo { id: CUSTOMS, name: "Таможня", available: true },
-    MapInfo { id: WOODS, name: "Лес", available: true },
-    MapInfo { id: SHORELINE, name: "Берег", available: true },
-    MapInfo { id: INTERCHANGE, name: "Развязка", available: true },
-    MapInfo { id: RESERVE, name: "Резерв", available: true },
-    MapInfo { id: LIGHTHOUSE, name: "Маяк", available: true },
-    MapInfo { id: STREETS, name: "Улицы Таркова", available: true },
-    MapInfo { id: FACTORY, name: "Завод", available: true },
-    MapInfo { id: GROUND_ZERO, name: "Эпицентр", available: true },
-    MapInfo { id: LABYRINTH, name: "Лабиринт", available: true },
-    MapInfo { id: ICEBREAKER, name: "Ледокол", available: true },
+    MapInfo { id: LAB, name: "Лаборатория", name_en: "The Lab", available: true },
+    MapInfo { id: CUSTOMS, name: "Таможня", name_en: "Customs", available: true },
+    MapInfo { id: WOODS, name: "Лес", name_en: "Woods", available: true },
+    MapInfo { id: SHORELINE, name: "Берег", name_en: "Shoreline", available: true },
+    MapInfo { id: INTERCHANGE, name: "Развязка", name_en: "Interchange", available: true },
+    MapInfo { id: RESERVE, name: "Резерв", name_en: "Reserve", available: true },
+    MapInfo { id: LIGHTHOUSE, name: "Маяк", name_en: "Lighthouse", available: true },
+    MapInfo { id: STREETS, name: "Улицы Таркова", name_en: "Streets of Tarkov", available: true },
+    MapInfo { id: FACTORY, name: "Завод", name_en: "Factory", available: true },
+    MapInfo { id: GROUND_ZERO, name: "Эпицентр", name_en: "Ground Zero", available: true },
+    MapInfo { id: LABYRINTH, name: "Лабиринт", name_en: "The Labyrinth", available: true },
+    MapInfo { id: ICEBREAKER, name: "Ледокол", name_en: "Icebreaker", available: true },
 ];
 
 /// Карта по id; неизвестная или недоступная — Лаба.
@@ -42,7 +51,7 @@ pub fn get(id: &str) -> &'static MapInfo {
 }
 
 pub fn name(id: &str) -> &'static str {
-    MAPS.iter().find(|m| m.id == id).map(|m| m.name).unwrap_or("?")
+    MAPS.iter().find(|m| m.id == id).map(|m| m.title()).unwrap_or("?")
 }
 
 /// Карта в дампе tarkov.dev. У Эпицентра две версии: до 21 уровня и 21+ — берём 21+,

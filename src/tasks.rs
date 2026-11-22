@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::labs::Pos;
+use crate::lang::Lang;
 
 #[derive(Clone, Debug)]
 pub struct Task {
@@ -68,21 +69,23 @@ impl Task {
     }
 }
 
-pub fn trader_name(id: &str) -> &'static str {
-    match id {
-        "54cb50c76803fa8b248b4571" => "Прапор",
-        "54cb57776803fa99248b456e" => "Терапевт",
-        "579dc571d53a0658a154fbec" => "Скупщик",
-        "58330581ace78e27b8b10cee" => "Лыжник",
-        "5935c25fb3acc3127c3d8cd9" => "Миротворец",
-        "5a7c2eca46aef81a7ca2145d" => "Механик",
-        "5ac3b934156ae10c4430e83c" => "Барахольщик",
-        "5c0647fdd443bc2504c2d371" => "Егерь",
-        "6617beeaa9cfa777ca915b7c" => "Реф",
-        "638f541a29ffd1183d187f57" => "Смотритель",
-        "656f0f98d80a697f855d34b1" => "BTR",
-        _ => "Торговец",
-    }
+/// Имя торговца как в игре.
+pub fn trader_name(id: &str, lang: Lang) -> &'static str {
+    let (ru, en) = match id {
+        "54cb50c76803fa8b248b4571" => ("Прапор", "Prapor"),
+        "54cb57776803fa99248b456e" => ("Терапевт", "Therapist"),
+        "579dc571d53a0658a154fbec" => ("Скупщик", "Fence"),
+        "58330581ace78e27b8b10cee" => ("Лыжник", "Skier"),
+        "5935c25fb3acc3127c3d8cd9" => ("Миротворец", "Peacekeeper"),
+        "5a7c2eca46aef81a7ca2145d" => ("Механик", "Mechanic"),
+        "5ac3b934156ae10c4430e83c" => ("Барахольщик", "Ragman"),
+        "5c0647fdd443bc2504c2d371" => ("Егерь", "Jaeger"),
+        "6617beeaa9cfa777ca915b7c" => ("Реф", "Ref"),
+        "638f541a29ffd1183d187f57" => ("Смотритель", "Lightkeeper"),
+        "656f0f98d80a697f855d34b1" => ("Водитель БТР", "BTR Driver"),
+        _ => ("Торговец", "Trader"),
+    };
+    lang.pick(ru, en)
 }
 
 fn values(v: &Value) -> Vec<&Value> {
@@ -97,21 +100,21 @@ fn pos(v: &Value) -> Option<Pos> {
     Some(Pos { x: v["x"].as_f64()?, y: v["y"].as_f64().unwrap_or(0.0), z: v["z"].as_f64()? })
 }
 
-/// Читает задания из кэша режима. `items_ru` — переводы предметов («<id> Name»),
+/// Читает задания из кэша режима. `item_names` — переводы предметов на языке `lang` («<id> Name»),
 /// `map_names` — id карты в дампе → её normalizedName.
-pub fn load(dir: &Path, items_ru: &HashMap<String, String>, map_names: &HashMap<String, String>) -> Vec<Task> {
+pub fn load(dir: &Path, item_names: &HashMap<String, String>, map_names: &HashMap<String, String>, lang: Lang) -> Vec<Task> {
     let read = |name: &str| -> Option<Value> {
         let v: Value = serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()?;
         v.get("data").cloned()
     };
     let Some(data) = read("tasks.json") else { return Vec::new() };
-    let ru: HashMap<String, String> = read("tasks_ru.json")
+    let names_tr: HashMap<String, String> = read(&format!("tasks_{}.json", lang.code()))
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let tr = |key: &str| ru.get(key).cloned();
+    let tr = |key: &str| names_tr.get(key).cloned();
     let quest_items = data.get("questItems").cloned().unwrap_or(Value::Null);
     let item_name = |id: &str| -> String {
-        items_ru
+        item_names
             .get(&format!("{id} Name"))
             .cloned()
             .or_else(|| quest_items.get(id).and_then(|q| q["name"].as_str()).and_then(&tr))
@@ -140,7 +143,7 @@ pub fn load(dir: &Path, items_ru: &HashMap<String, String>, map_names: &HashMap<
     raw.iter()
         .filter_map(|t| {
             let id = t["id"].as_str()?.to_string();
-            let objectives = t["objectives"].as_array().into_iter().flatten().map(|o| objective(o, &tr, &item_name, &map_of, &maps_of)).collect();
+            let objectives = t["objectives"].as_array().into_iter().flatten().map(|o| objective(o, lang, &tr, &item_name, &map_of, &maps_of)).collect();
             let keys = t["neededKeys"]
                 .as_array()
                 .into_iter()
@@ -159,7 +162,7 @@ pub fn load(dir: &Path, items_ru: &HashMap<String, String>, map_names: &HashMap<
                 .collect();
             Some(Task {
                 name: names.get(id.as_str()).cloned().unwrap_or_else(|| id.clone()),
-                trader: trader_name(t["trader"].as_str().unwrap_or("")),
+                trader: trader_name(t["trader"].as_str().unwrap_or(""), lang),
                 level: t["minPlayerLevel"].as_u64().unwrap_or(0) as u32,
                 kappa: t["kappaRequired"].as_bool().unwrap_or(false),
                 lightkeeper: t["lightkeeperRequired"].as_bool().unwrap_or(false),
@@ -177,6 +180,7 @@ pub fn load(dir: &Path, items_ru: &HashMap<String, String>, map_names: &HashMap<
 
 fn objective(
     o: &Value,
+    lang: Lang,
     tr: &dyn Fn(&str) -> Option<String>,
     item_name: &dyn Fn(&str) -> String,
     map_of: &dyn Fn(&str) -> Option<String>,
@@ -186,40 +190,50 @@ fn objective(
     let count = o["count"].as_u64().unwrap_or(1);
     let fir = o["foundInRaid"].as_bool().unwrap_or(false);
     let mut details = Vec::new();
+    // игровые термины — на языке названий, как в клиенте
+    let t = |ru: &'static str, en: &'static str| lang.pick(ru, en);
+    let or = t(" или ", " or ");
+    let fir_text = if fir { t(" · найдено в рейде", " · found in raid") } else { "" };
 
     // предметы: «любой из 50» не расписываем — это видно из текста
     let items: Vec<String> = o["items"].as_array().into_iter().flatten().filter_map(|i| i.as_str()).map(item_name).collect();
     if !items.is_empty() && items.len() <= 3 {
         details.push(format!(
-            "{}{}{}",
-            items.join(" или "),
+            "{}{}{fir_text}",
+            items.join(or),
             if count > 1 { format!(" × {count}") } else { String::new() },
-            if fir { " · найдено в рейде" } else { "" }
         ));
     } else if count > 1 && matches!(kind, "giveItem" | "findItem" | "sellItem" | "plantItem") {
-        details.push(format!("Количество: {count}{}", if fir { " · найдено в рейде" } else { "" }));
+        details.push(format!("{}: {count}{fir_text}", t("Количество", "Count")));
     } else if count > 1 && matches!(kind, "shoot" | "extract" | "experience" | "useItem") {
-        details.push(format!("Сколько раз: {count}"));
+        details.push(format!("{}: {count}", t("Сколько раз", "Times")));
     }
     if let Some(q) = o["questItem"].as_str() {
-        details.push(format!("Предмет задания: {}", item_name(q)));
+        details.push(format!("{}: {}", t("Предмет задания", "Quest item"), item_name(q)));
     }
     if let Some(m) = o["markerItem"].as_str() {
-        details.push(format!("Чем отметить: {}", item_name(m)));
+        details.push(format!("{}: {}", t("Чем отметить", "Mark with"), item_name(m)));
     }
     for alts in o["requiredKeys"].as_array().into_iter().flatten() {
         let names: Vec<String> = alts.as_array().into_iter().flatten().filter_map(|k| k.as_str()).map(item_name).collect();
         if !names.is_empty() {
-            details.push(format!("🔑 Нужен ключ: {}", names.join(" или ")));
+            details.push(format!("🔑 {}: {}", t("Нужен ключ", "Key required"), names.join(or)));
         }
     }
     if let Some(d) = o["distance"]["value"].as_f64().filter(|d| *d > 0.0) {
         let more = o["distance"]["compareMethod"].as_str() != Some("<=");
-        details.push(format!("Дистанция {} {d:.0} м", if more { "от" } else { "до" }));
+        details.push(match (lang, more) {
+            (Lang::Ru, more) => format!("Дистанция {} {d:.0} м", if more { "от" } else { "до" }),
+            (Lang::En, true) => format!("Distance: {d:.0} m or more"),
+            (Lang::En, false) => format!("Distance: up to {d:.0} m"),
+        });
     }
     let (from, until) = (o["timeFromHour"].as_u64().unwrap_or(0), o["timeUntilHour"].as_u64().unwrap_or(0));
     if from != until {
-        details.push(format!("Время в игре: с {from}:00 до {until}:00"));
+        details.push(match lang {
+            Lang::Ru => format!("Время в игре: с {from}:00 до {until}:00"),
+            Lang::En => format!("In-game time: {from}:00–{until}:00"),
+        });
     }
 
     // зоны и места квестовых предметов; у версий одной карты точки совпадают — сливаем
@@ -271,7 +285,7 @@ mod tests {
         let mut names = HashMap::new();
         names.insert("653e6760052c01c1c805532f".to_string(), "ground-zero".to_string());
         names.insert("65b8d6f5cdde2479cb2a3125".to_string(), "ground-zero-21".to_string());
-        let tasks = load(&dir, &ru, &names);
+        let tasks = load(&dir, &ru, &names, Lang::Ru);
         assert!(tasks.len() > 100);
         let gz: Vec<&Task> = tasks.iter().filter(|t| t.is_local(crate::maps::GROUND_ZERO)).collect();
         assert!(gz.len() >= 5, "{}", gz.len());

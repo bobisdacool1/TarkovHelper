@@ -7,6 +7,7 @@ mod categories;
 mod data;
 mod hotkey;
 mod labs;
+mod lang;
 mod maps;
 mod raid_overlay;
 mod raids;

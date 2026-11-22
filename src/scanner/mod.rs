@@ -652,7 +652,7 @@ mod tests {
         let img = image::load_from_memory(include_bytes!("../../tools/scanner-prototype/backpack.png")).unwrap().to_rgba8();
         let gray = image::imageops::grayscale(&img);
         let (boxes, lat) = vision::items_around(&gray, 300, 450, 84.0, None).unwrap();
-        let data = crate::data::load_map(crate::data::Mode::Pve, crate::maps::LAB).ok();
+        let data = crate::data::load_map_in(crate::data::Mode::Pve, crate::maps::LAB, crate::lang::Lang::Ru).ok();
         let m = data.as_ref().map(|d| matcher::Matcher::new(&d.items));
         let mut known = Vec::new();
         for b in boxes.iter().filter(|b| b.x0 >= 200) {
@@ -725,7 +725,7 @@ mod tooltip_tests {
         };
         let tooltip = read(&tooltip_image(&img, tip));
         eprintln!("подсказка: {tooltip:?}");
-        let Ok(data) = crate::data::load_map(crate::data::Mode::Pve, crate::maps::LAB) else {
+        let Ok(data) = crate::data::load_map_in(crate::data::Mode::Pve, crate::maps::LAB, crate::lang::Lang::Ru) else {
             eprintln!("пропуск сопоставления: нет кэша дампа PvE");
             return;
         };

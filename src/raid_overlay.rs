@@ -233,7 +233,7 @@ impl Render for RaidOverlay {
             let id = m.id;
             segmented(
                 ElementId::named_usize("map", i),
-                m.name,
+                m.title(),
                 self.map == Some(id),
                 cx.listener(move |this, _, _, cx| {
                     this.map = Some(id);

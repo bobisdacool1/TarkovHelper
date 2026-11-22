@@ -10,6 +10,8 @@ use crate::data::data_dir;
 pub struct Settings {
     /// "pve" | "pvp"
     pub mode: String,
+    /// Язык названий из игры: "ru" | "en" (интерфейс — русский).
+    pub lang: String,
     pub threshold: i64,
     pub hidden_items: BTreeSet<String>,
     pub hidden_groups: BTreeSet<usize>,
@@ -88,6 +90,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: "pve".into(),
+            lang: "ru".into(),
             threshold: 100_000,
             hidden_items: BTreeSet::new(),
             hidden_groups: BTreeSet::new(),

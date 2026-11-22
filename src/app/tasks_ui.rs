@@ -212,7 +212,7 @@ impl HelperApp {
 
         let chips = div().mt_3().flex().flex_wrap().gap_1().children(crate::maps::MAPS.iter().enumerate().map(|(i, m)| {
             let id = m.id;
-            segmented(ElementId::named_usize("task-map", i), m.name, m.id == map, cx.listener(move |this, _, _, cx| {
+            segmented(ElementId::named_usize("task-map", i), m.title(), m.id == map, cx.listener(move |this, _, _, cx| {
                 this.set_tasks_map(id, cx);
             }))
         }));

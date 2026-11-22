@@ -277,6 +277,7 @@ impl HelperApp {
         })
         .detach();
         let st = settings::load();
+        crate::lang::set(crate::lang::Lang::from_code(&st.lang));
         let raid_log = cx.new(|_| crate::raid_overlay::RaidLog::load());
         cx.observe(&raid_log, |_, _, cx| cx.notify()).detach();
         let scanner_rt = cx.new(|cx| crate::scanner::Scanner::new(st.scanner.clone(), raid_log.clone(), cx));
@@ -419,6 +420,7 @@ impl HelperApp {
     fn to_settings(&self) -> settings::Settings {
         settings::Settings {
             mode: if self.mode == Mode::Pvp { "pvp" } else { "pve" }.into(),
+            lang: crate::lang::get().code().into(),
             threshold: self.threshold,
             hidden_items: self.hidden_items.iter().cloned().collect(),
             hidden_groups: self.hidden_groups.iter().copied().collect(),
@@ -467,6 +469,7 @@ impl HelperApp {
         cx.notify();
         let started = std::time::Instant::now();
         let loaded = self.floor_images.clone();
+        let lang = crate::lang::get();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -475,7 +478,7 @@ impl HelperApp {
                         data::download_dump(mode)?;
                         crate::labs::refresh_rooms_from_repo();
                     }
-                    let lab = data::load_map(mode, map)?;
+                    let lab = data::load_map_in(mode, map, lang)?;
                     let (geo, paths) = tiles::prepare(&lab)?;
                     // при обновлении цен картинки те же — не декодируем заново
                     let images = paths
@@ -491,7 +494,9 @@ impl HelperApp {
             this.update(cx, |this, cx| {
                 let mut refresh_after = false;
                 match result {
-                    Ok((lab, geo, images)) if lab.mode == this.mode && lab.map == this.map => {
+                    Ok((lab, geo, images))
+                        if lab.mode == this.mode && lab.map == this.map && lang == crate::lang::get() =>
+                    {
                         eprintln!(
                             "tarkov-helper: данные {} ({}) за {} мс",
                             mode.label(),
@@ -558,6 +563,15 @@ impl HelperApp {
         if self.mode != mode {
             self.mode = mode;
             self.load(false, cx);
+        }
+    }
+
+    /// Язык названий из игры: перечитываем данные (если в кэше нет переводов — докачаются).
+    fn set_lang(&mut self, lang: crate::lang::Lang, cx: &mut Context<Self>) {
+        if crate::lang::get() != lang {
+            crate::lang::set(lang);
+            self.load(false, cx);
+            cx.notify();
         }
     }
 
@@ -2105,7 +2119,7 @@ impl HelperApp {
                             cx.notify();
                         }))
                     })
-                    .child(m.name)
+                    .child(m.title())
                     .child(
                         div()
                             .text_xs()
@@ -2849,6 +2863,21 @@ impl HelperApp {
                                 .child(segmented("st-pvp", "PvP", self.mode == Mode::Pvp, cx.listener(|this, _, _, cx| this.set_mode(Mode::Pvp, cx)))),
                         ),
                     )
+                    .child({
+                        use crate::lang::Lang;
+                        let lang = crate::lang::get();
+                        row(
+                            "Язык названий",
+                            "Предметы, задания, карты и торговцы — как в клиенте игры".into(),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(segmented("st-lang-ru", "Русский", lang == Lang::Ru, cx.listener(|this, _, _, cx| this.set_lang(Lang::Ru, cx))))
+                                .child(segmented("st-lang-en", "English", lang == Lang::En, cx.listener(|this, _, _, cx| this.set_lang(Lang::En, cx)))),
+                        )
+                    })
                     .child(
                         row("Автообновление цен", "При запуске, если данным больше часа, и каждые 30 минут".into())
                             .child(toggle("st-autoref", self.auto_refresh).on_click(cx.listener(|this, _, _, cx| {
