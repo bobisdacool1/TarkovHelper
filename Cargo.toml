@@ -1,6 +1,6 @@
 [package]
 name = "tarkov-helper"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Карта ценного лута Escape from Tarkov: Лаборатория и Маяк"
 repository = "https://github.com/bobisdacool1/TarkovHelper"
