@@ -172,6 +172,12 @@ struct RawExtract {
 #[derive(Deserialize)]
 struct RawTransit {
     position: Pos,
+    /// Куда ведёт: id карты.
+    #[serde(default)]
+    map: Option<String>,
+    /// Ключ перевода: «tr_customs_reserve_DESC» → «Переход на Резерв».
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +284,8 @@ pub struct MapData {
     pub rooms: Vec<Room>,
     /// item id -> где нужен.
     pub needs: HashMap<String, Vec<Need>>,
+    /// Все задания торговцев (не только этой карты).
+    pub tasks: Vec<crate::tasks::Task>,
 }
 
 impl MapData {
@@ -356,11 +364,14 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
         })
         .collect();
 
+    let map_names: HashMap<String, String> =
+        maps.data.maps.iter().map(|(id, m)| (id.clone(), m.normalized_name.clone())).collect();
+    let tasks = crate::tasks::load(&dir, &ru.data, &map_names);
     let lab = maps
         .data
         .maps
         .into_values()
-        .find(|m| m.normalized_name == map)
+        .find(|m| m.normalized_name == crate::maps::dump_name(map))
         .with_context(|| format!("в дампе нет карты {map}"))?;
 
     // зоны за дверями размечены только на Лабе
@@ -395,7 +406,14 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
         })
         .collect();
     extracts.extend(lab.transits.into_iter().map(|t| Extract {
-        name: "Переход".into(),
+        // «→ Резерв»; если карты нет в переводах — текст описания перехода
+        name: t
+            .map
+            .as_ref()
+            .and_then(|m| maps_ru.get(&format!("{m} Name")))
+            .map(|dest| format!("→ {dest}"))
+            .or_else(|| t.description.as_ref().and_then(|d| maps_ru.get(d)).cloned())
+            .unwrap_or_else(|| "Переход".into()),
         faction: "transit".into(),
         floor: floor_of(t.position),
         pos: t.position,
@@ -414,7 +432,7 @@ pub fn load_map(mode: Mode, map: &'static str) -> Result<MapData> {
 
     let needs = load_needs(&dir);
 
-    Ok(MapData { map, mode, fetched_at, items, loot, locks, extracts, spawns, rooms, needs })
+    Ok(MapData { map, mode, fetched_at, items, loot, locks, extracts, spawns, rooms, needs, tasks })
 }
 
 pub fn normalize(s: &str) -> String {
@@ -508,4 +526,21 @@ fn load_needs(dir: &Path) -> HashMap<String, Vec<Need>> {
         }
     }
     needs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// На реальном кэше: у переходов Таможни подписано, куда они ведут.
+    #[test]
+    fn transits_have_destination() {
+        if !has_dump(Mode::Pve) {
+            return;
+        }
+        let d = load_map(Mode::Pve, crate::maps::CUSTOMS).unwrap();
+        let names: Vec<&str> = d.extracts.iter().filter(|e| e.faction == "transit").map(|e| e.name.as_str()).collect();
+        assert!(!names.is_empty());
+        assert!(names.contains(&"→ Резерв"), "{names:?}");
+    }
 }

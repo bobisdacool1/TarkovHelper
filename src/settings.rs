@@ -26,7 +26,7 @@ pub struct Settings {
     pub auto_refresh: bool,
     /// Проверять обновления приложения при запуске.
     pub auto_update_check: bool,
-    /// Открытый раздел: "maps" | "scanner" | "raids" | "settings".
+    /// Открытый раздел: "maps" | "tasks" | "scanner" | "raids" | "settings".
     pub section: String,
     /// Выбранная карта (id из maps.rs).
     pub map: String,

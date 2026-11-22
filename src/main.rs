@@ -8,6 +8,7 @@ mod raid_overlay;
 mod raids;
 mod scanner;
 mod settings;
+mod tasks;
 mod text_input;
 mod tiles;
 mod updater;

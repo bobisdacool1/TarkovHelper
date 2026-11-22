@@ -6,8 +6,8 @@ use image::{ImageFormat, RgbaImage};
 use std::path::{Path, PathBuf};
 
 use crate::data::{data_dir, http_get, MapData};
-use crate::labs::{self, Room, FLOOR_DIRS, TILE_ZOOM};
-use crate::maps::{self, SvgMap};
+use crate::labs::Room;
+use crate::maps::{self, SvgMap, TileMap};
 
 /// Проекция игровых координат на картинку этажа (одинакова для всех этажей карты).
 #[derive(Clone, Copy, Debug)]
@@ -56,19 +56,32 @@ impl Geo {
 /// Готовит подложку карты: проекцию и картинки этажей (скачивает и кэширует недостающее).
 pub fn prepare(data: &MapData) -> Result<(Geo, Vec<PathBuf>)> {
     if let Some(svg) = maps::svg_map(data.map) {
-        let img = svg_image(data.map, svg)?;
-        return Ok((Geo::Svg(svg), vec![img]));
+        let images = (0..svg.floors.len()).map(|f| svg_image(data.map, svg, f)).collect::<Result<Vec<_>>>()?;
+        return Ok((Geo::Svg(svg), images));
     }
-    let range = TileRange::for_data(data);
+    let spec = maps::tile_map(data.map).with_context(|| format!("у карты {} нет подложки", data.map))?;
+    let range = TileRange::for_data(spec, data);
     ensure_floors(range)?;
-    let images = (0..FLOOR_DIRS.len())
+    let images = (0..spec.floors.len())
         .map(|f| floor_image(range, f, &data.rooms))
         .collect::<Result<Vec<_>>>()?;
     Ok((Geo::Tiles(range), images))
 }
 
-/// Растр SVG-карты. SVG качается один раз; картинка — по хэшу SVG и размеру.
-fn svg_image(map: &str, svg: SvgMap) -> Result<PathBuf> {
+/// Картинка этажа в памяти — для `img()`. Грузим сами, а не `img(path)`: из кэша ассетов GPUI
+/// картинку не выгрузить, и каждая открытая карта держала бы ~100–160 МБ до закрытия приложения.
+/// Свою можно отдать `cx.drop_image` при смене карты.
+pub fn decode(path: &Path) -> Result<std::sync::Arc<gpui::RenderImage>> {
+    let mut data = image::open(path).with_context(|| format!("картинка {}", path.display()))?.into_rgba8();
+    // GPUI ждёт BGRA
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(data)])))
+}
+
+/// Растр этажа SVG-карты. SVG качается один раз; картинка — по хэшу SVG, слоям и размеру.
+fn svg_image(map: &str, svg: SvgMap, floor: usize) -> Result<PathBuf> {
     use resvg::{tiny_skia, usvg};
     use std::hash::{Hash, Hasher};
     let dir = data_dir().join("maps");
@@ -78,7 +91,7 @@ fn svg_image(map: &str, svg: SvgMap) -> Result<PathBuf> {
         let bytes = http_get(svg.url).with_context(|| format!("скачать {}", svg.url))?;
         write_atomic(&src, &bytes)?;
     }
-    let bytes = std::fs::read(&src)?;
+    let bytes = only_layers(&std::fs::read(&src)?, svg.layers, svg.floors[floor]);
     let (w, h) = svg.image_size();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -107,6 +120,15 @@ fn svg_image(map: &str, svg: SvgMap) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Прячет слои SVG (`<g id="…">` из `layers`), которых нет в `keep`.
+fn only_layers(svg: &[u8], layers: &[&str], keep: &[&str]) -> Vec<u8> {
+    let mut text = String::from_utf8_lossy(svg).into_owned();
+    for layer in layers.iter().filter(|l| !keep.contains(l)) {
+        text = text.replace(&format!("<g id=\"{layer}\""), &format!("<g display=\"none\" id=\"{layer}\""));
+    }
+    text.into_bytes()
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
@@ -117,6 +139,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Какой кусок сетки тайлов склеен в картинки (одинаково для всех этажей).
 #[derive(Clone, Copy, Debug)]
 pub struct TileRange {
+    pub spec: TileMap,
     pub tx0: u32,
     pub ty0: u32,
     pub w: u32,
@@ -124,13 +147,14 @@ pub struct TileRange {
 }
 
 impl TileRange {
-    /// Охватывает все точки лута и двери с запасом.
-    pub fn for_data(data: &MapData) -> Self {
-        let n = (1u32 << TILE_ZOOM) as f64;
+    /// Охватывает всю карту (`bounds`) или все точки лута и двери — с запасом.
+    pub fn for_data(spec: TileMap, data: &MapData) -> Self {
+        let n = (1u32 << spec.zoom) as f64;
         let (mut u0, mut u1, mut v0, mut v1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-        let positions = data.loot.iter().map(|l| l.pos).chain(data.locks.iter().map(|l| l.pos));
-        for p in positions {
-            let (u, v) = labs::grid_uv(p.x, p.z);
+        let positions = data.loot.iter().map(|l| (l.pos.x, l.pos.z)).chain(data.locks.iter().map(|l| (l.pos.x, l.pos.z)));
+        let corners = spec.bounds.into_iter().flat_map(|b| [(b[0][0], b[0][1]), (b[1][0], b[1][1])]);
+        for (x, z) in positions.chain(corners) {
+            let (u, v) = spec.uv(x, z);
             u0 = u0.min(u);
             u1 = u1.max(u);
             v0 = v0.min(v);
@@ -141,7 +165,7 @@ impl TileRange {
         let ty0 = ((v0 - margin) * n).floor().max(0.0) as u32;
         let tx1 = ((u1 + margin) * n).ceil().min(n) as u32;
         let ty1 = ((v1 + margin) * n).ceil().min(n) as u32;
-        TileRange { tx0, ty0, w: tx1 - tx0, h: ty1 - ty0 }
+        TileRange { spec, tx0, ty0, w: tx1 - tx0, h: ty1 - ty0 }
     }
 
     pub fn pixel_size(&self) -> (f32, f32) {
@@ -150,36 +174,46 @@ impl TileRange {
 
     /// Игровые координаты -> пиксели склеенной картинки этажа.
     pub fn project(&self, x: f64, z: f64) -> (f32, f32) {
-        let (u, v) = labs::grid_uv(x, z);
-        let full = (256u32 << TILE_ZOOM) as f64;
+        let (u, v) = self.spec.uv(x, z);
+        let full = (256u32 << self.spec.zoom) as f64;
         ((u * full - (self.tx0 * 256) as f64) as f32, (v * full - (self.ty0 * 256) as f64) as f32)
     }
 
     /// Пиксели склеенной картинки -> игровые (x, z).
     pub fn unproject(&self, px: f32, py: f32) -> (f64, f64) {
-        let full = (256u32 << TILE_ZOOM) as f64;
+        let full = (256u32 << self.spec.zoom) as f64;
         let u = (px as f64 + (self.tx0 * 256) as f64) / full;
         let v = (py as f64 + (self.ty0 * 256) as f64) / full;
-        ((v * 175.0 - 193.7) / 0.575, (u * 175.0 - 281.2) / 0.575)
+        self.spec.game(u, v)
     }
 
+    /// Имя склейки: у Лабы прежнее (`labs_1st_z4_…`), чтобы не качать кэш заново.
     pub fn floor_path(&self, floor: usize) -> PathBuf {
         data_dir().join("maps").join(format!(
-            "labs_{}_z{}_{}_{}_{}x{}.png",
-            FLOOR_DIRS[floor], TILE_ZOOM, self.tx0, self.ty0, self.w, self.h
+            "{}_{}_z{}_{}_{}_{}x{}.png",
+            self.spec.key,
+            self.spec.floors[floor].join("+"),
+            self.spec.zoom,
+            self.tx0,
+            self.ty0,
+            self.w,
+            self.h
         ))
     }
 }
 
-/// Скачивает и склеивает недостающие этажи.
+/// Скачивает и склеивает недостающие этажи; слои этажа накладываются по порядку.
 fn ensure_floors(range: TileRange) -> Result<()> {
     std::fs::create_dir_all(data_dir().join("maps"))?;
-    for floor in 0..FLOOR_DIRS.len() {
+    for floor in 0..range.spec.floors.len() {
         let path = range.floor_path(floor);
         if path.exists() {
             continue;
         }
-        let img = stitch(range, FLOOR_DIRS[floor])?;
+        let mut img = RgbaImage::new(range.w * 256, range.h * 256);
+        for layer in range.spec.floors[floor] {
+            image::imageops::overlay(&mut img, &stitch(range, layer)?, 0, 0);
+        }
         let tmp = path.with_extension("png.tmp");
         img.save_with_format(&tmp, ImageFormat::Png)?;
         std::fs::rename(tmp, path)?;
@@ -200,7 +234,7 @@ fn stitch(range: TileRange, dir: &str) -> Result<RgbaImage> {
                     chunk
                         .iter()
                         .map(|&(x, y)| {
-                            let url = format!("{}/{dir}/{TILE_ZOOM}/{x}/{y}.png", labs::TILE_ROOT);
+                            let url = format!("{}/{dir}/{}/{x}/{y}.png", range.spec.root, range.spec.zoom);
                             let img = http_get(&url)
                                 .ok()
                                 .and_then(|b| image::load_from_memory_with_format(&b, ImageFormat::Png).ok())
@@ -252,7 +286,7 @@ fn floor_image(range: TileRange, floor: usize, rooms: &[Room]) -> Result<PathBuf
     let (w, hgt) = (img.width() as i64, img.height() as i64);
     const WALL: f32 = 3.0;
     // плитка пола ~1 м
-    let tile = (256u32 << TILE_ZOOM) as f32 * 0.575 / 175.0;
+    let tile = range.spec.px_per_m() as f32;
     for room in solid {
         let pts: Vec<(f32, f32)> = room.poly.iter().map(|p| range.project(p[0], p[1])).collect();
         // ровный пол цвета соседнего помещения

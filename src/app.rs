@@ -8,13 +8,18 @@ use gpui::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::categories::GROUPS;
 use crate::data::{self, fmt_rub, fmt_short, Item, MapData, Mode};
 use crate::labs::{key_color, point_in_poly};
 use crate::settings;
+use crate::tasks::Task;
 use crate::text_input::{InputChanged, TextInput};
 use crate::tiles::{self, Geo};
+
+mod tasks_ui;
+use tasks_ui::no_map_placeholder;
 
 const SIDEBAR_W: f32 = 400.0;
 const PAD: f32 = 16.0;
@@ -35,9 +40,37 @@ pub(crate) const MUTED: u32 = 0x7d7666;
 /// Маркер спавна ЧВК: салатовый — не путается с картами доступа, выходами и ценами лута.
 const SPAWN: u32 = 0xd4e157;
 
+/// Картинка этажа: файл в кэше и она же в памяти.
+type FloorImage = (std::path::PathBuf, Arc<gpui::RenderImage>);
+
+/// Выгружает картинки старой карты из памяти окон (атлас GPU) — иначе они копятся до закрытия.
+/// Отдельной задачей: внутри обработчика клика окно занято, и `drop_image` его бы не нашёл.
+fn release_images<T: 'static>(images: Vec<FloorImage>, cx: &mut Context<T>) {
+    if images.is_empty() {
+        return;
+    }
+    cx.spawn(async move |_, cx| {
+        cx.update(|cx| {
+            for (_, image) in images {
+                cx.drop_image(image, None);
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Цвета целей задания: номер цели в списке и на карте одного цвета.
+const OBJ_COLORS: [u32; 8] = [0xffca28, 0x29b6f6, 0xef5350, 0x66bb6a, 0xab47bc, 0xff7043, 0x26c6da, 0xec407a];
+
+fn obj_color(i: usize) -> u32 {
+    OBJ_COLORS[i % OBJ_COLORS.len()]
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Maps,
+    Tasks,
     Scanner,
     Raids,
     Settings,
@@ -105,7 +138,7 @@ pub struct HelperApp {
     /// Проекция координат на картинки этажей.
     geo: Option<Geo>,
     /// Картинки этажей (с дорисованными комнатами).
-    floor_images: Vec<std::path::PathBuf>,
+    floor_images: Vec<FloorImage>,
     threshold: i64,
     search: String,
     search_input: Entity<TextInput>,
@@ -130,6 +163,12 @@ pub struct HelperApp {
     section: Section,
     /// Открыт список выбора карты.
     map_menu_open: bool,
+    /// Карта в разделе «Задания» (может быть и без подложки — тогда только список).
+    tasks_map: &'static str,
+    /// Открытое задание (id).
+    selected_task: Option<String>,
+    task_search: String,
+    task_search_input: Entity<TextInput>,
     scanner: settings::ScannerSettings,
     /// Какое сочетание сканера сейчас записывается.
     recording: Option<KeyRole>,
@@ -231,6 +270,12 @@ impl HelperApp {
             cx.notify();
         })
         .detach();
+        let task_search_input = cx.new(|cx| TextInput::new("Поиск задания… (название, торговец, цель)", cx));
+        cx.subscribe(&task_search_input, |this, input, _: &InputChanged, cx| {
+            this.task_search = input.read(cx).text().to_string();
+            cx.notify();
+        })
+        .detach();
         let st = settings::load();
         let raid_log = cx.new(|_| crate::raid_overlay::RaidLog::load());
         cx.observe(&raid_log, |_, _, cx| cx.notify()).detach();
@@ -263,12 +308,17 @@ impl HelperApp {
             auto_refresh: st.auto_refresh,
             auto_update_check: st.auto_update_check,
             section: match st.section.as_str() {
+                "tasks" => Section::Tasks,
                 "scanner" => Section::Scanner,
                 "raids" => Section::Raids,
                 "settings" => Section::Settings,
                 _ => Section::Maps,
             },
             map_menu_open: false,
+            tasks_map: crate::maps::get(&st.map).id,
+            selected_task: None,
+            task_search: String::new(),
+            task_search_input,
             recording: None,
             hotkey_error: None,
             hotkey_focus: cx.focus_handle(),
@@ -384,6 +434,7 @@ impl HelperApp {
             auto_update_check: self.auto_update_check,
             section: match self.section {
                 Section::Maps => "maps",
+                Section::Tasks => "tasks",
                 Section::Scanner => "scanner",
                 Section::Raids => "raids",
                 Section::Settings => "settings",
@@ -415,6 +466,7 @@ impl HelperApp {
         });
         cx.notify();
         let started = std::time::Instant::now();
+        let loaded = self.floor_images.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -424,7 +476,15 @@ impl HelperApp {
                         crate::labs::refresh_rooms_from_repo();
                     }
                     let lab = data::load_map(mode, map)?;
-                    let (geo, images) = tiles::prepare(&lab)?;
+                    let (geo, paths) = tiles::prepare(&lab)?;
+                    // при обновлении цен картинки те же — не декодируем заново
+                    let images = paths
+                        .into_iter()
+                        .map(|path| match loaded.iter().find(|l| l.0 == path) {
+                            Some(l) => Ok(l.clone()),
+                            None => tiles::decode(&path).map(|image| (path, image)),
+                        })
+                        .collect::<anyhow::Result<Vec<FloorImage>>>()?;
                     anyhow::Ok((lab, geo, images))
                 })
                 .await;
@@ -449,7 +509,12 @@ impl HelperApp {
                         refresh_after = !need_download && stale && this.auto_refresh;
                         this.data = Some(Rc::new(lab));
                         this.geo = Some(geo);
-                        this.floor_images = images;
+                        let old = std::mem::replace(&mut this.floor_images, images);
+                        let stale = old
+                            .into_iter()
+                            .filter(|o| !this.floor_images.iter().any(|n| Arc::ptr_eq(&n.1, &o.1)))
+                            .collect();
+                        release_images(stale, cx);
                         this.status = Status::Idle;
                         this.selected_point = None;
                     }
@@ -468,13 +533,15 @@ impl HelperApp {
 
     /// Переключает карту: старая подложка убирается сразу, новая грузится в фоне.
     fn set_map(&mut self, map: &'static str, cx: &mut Context<Self>) {
+        self.tasks_map = map;
         if self.map == map {
             return;
         }
         self.map = map;
+        self.selected_task = None;
         self.data = None;
         self.geo = None;
-        self.floor_images.clear();
+        release_images(std::mem::take(&mut self.floor_images), cx);
         self.floor_view = None;
         self.selected_point = None;
         self.hover = None;
@@ -705,7 +772,7 @@ impl HelperApp {
                 }
                 let x = self.offset.0 + self.floor_origin(f) * s;
                 let y = self.offset.1;
-                let Some(image) = self.floor_images.get(f).cloned() else { continue };
+                let Some(image) = self.floor_images.get(f).map(|i| i.1.clone()) else { continue };
                 layers.push(
                     img(image)
                         .absolute()
@@ -906,7 +973,8 @@ impl HelperApp {
                             .border_color(rgb(0xffffff))
                             .shadow_md()
                             .child(svg().flex_none().path(icon).size(px(14.0)).text_color(rgb(0xffffff)))
-                            .when(s > 0.15, |el| {
+                            // переходов на карте 1–4 — куда ведут, видно при любом зуме
+                            .when(s > 0.15 || ex.faction == "transit", |el| {
                                 el.child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child(ex.name.clone()))
                             })
                             .on_hover(Self::hover_listener(
@@ -922,7 +990,12 @@ impl HelperApp {
                 }
             }
 
-            for v in self.visible_points(&d) {
+            let tasks_view = self.section == Section::Tasks;
+            if tasks_view {
+                self.task_layers(&d, &mut layers, cx);
+            }
+
+            for v in self.visible_points(&d).into_iter().filter(|_| !tasks_view) {
                 let p = &d.loot[v.idx];
                 if !self.floor_visible(p.floor) {
                     continue;
@@ -1001,6 +1074,7 @@ impl HelperApp {
                         .border_1()
                         .border_color(rgb(GOLD_DIM))
                         .shadow_lg()
+                        .max_w(px(380.0))
                         .text_sm()
                         .text_color(rgb(TEXT))
                         .children(h.lines.iter().map(|l| div().child(l.clone())))
@@ -1008,7 +1082,7 @@ impl HelperApp {
                 );
             }
 
-            if let Some(pi) = self.selected_point {
+            if let Some(pi) = self.selected_point.filter(|_| !tasks_view) {
                 let p = &d.loot[pi];
                 let (sx, sy) = self.to_screen(p.floor, p.pos.x, p.pos.z);
                 layers.push(self.render_popup(&d, pi, sx + 18.0, sy - 20.0, cx).into_any_element());
@@ -1016,8 +1090,9 @@ impl HelperApp {
         }
 
         // переключатель этажей (только у многоэтажных карт)
-        let views: [(Option<usize>, &'static str); 4] =
-            [(None, "Все этажи"), (Some(0), "Подвал"), (Some(1), "1 этаж"), (Some(2), "2 этаж")];
+        let views: Vec<(Option<usize>, &'static str)> = std::iter::once((None, "Все этажи"))
+            .chain(crate::maps::floor_tabs(self.map).iter().enumerate().map(|(i, t)| (Some(i), *t)))
+            .collect();
         layers.extend((self.floors().len() > 1).then(||
             div()
                 .absolute()
@@ -1935,6 +2010,15 @@ impl Render for HelperApp {
             .child(self.render_rail(cx))
             .map(|root| match self.section {
                 Section::Maps => root.child(self.render_sidebar(window, cx)).child(self.render_map(cx)),
+                Section::Tasks => {
+                    let side = self.render_tasks_sidebar(window, cx).into_any_element();
+                    let main = if crate::maps::get(self.tasks_map).id == self.tasks_map {
+                        self.render_map(cx).into_any_element()
+                    } else {
+                        no_map_placeholder(self.tasks_map).into_any_element()
+                    };
+                    root.child(side).child(main)
+                }
                 Section::Scanner => root.child(self.render_scanner(cx)),
                 Section::Raids => root.child(self.render_raids(cx)),
                 Section::Settings => root.child(self.render_settings(cx)),
@@ -1986,6 +2070,7 @@ impl HelperApp {
             .border_r_1()
             .border_color(rgb(GOLD_DIM))
             .child(item("nav-maps", "🗺", "КАРТЫ", Section::Maps, self.section == Section::Maps, cx))
+            .child(item("nav-tasks", "📜", "ЗАДАНИЯ", Section::Tasks, self.section == Section::Tasks, cx))
             .child(item("nav-scanner", "🔍", "СКАНЕР", Section::Scanner, self.section == Section::Scanner, cx))
             .child(item("nav-raids", "📊", "РЕЙДЫ", Section::Raids, self.section == Section::Raids, cx))
             .child(div().flex_1())
