@@ -55,7 +55,9 @@ fn main() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.bind_keys(text_input::key_bindings());
         cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+            // спрятанная карточка цены — тоже окно, но приложение не держит;
+            // неподтверждённое «После рейда» — держит
+            if cx.windows().iter().all(|w| w.downcast::<scanner::card::ScanCard>().is_some()) {
                 cx.quit();
             }
         })

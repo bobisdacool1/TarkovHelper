@@ -138,8 +138,26 @@ struct RawSell {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MapsData {
     maps: HashMap<String, RawMap>,
+    /// Типы контейнеров: id → имя (ключ перевода в maps_{язык}) и normalizedName.
+    #[serde(default)]
+    loot_containers: HashMap<String, RawContainerKind>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawContainerKind {
+    name: String,
+    normalized_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawContainer {
+    loot_container: String,
+    position: Pos,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +166,8 @@ struct RawMap {
     normalized_name: String,
     #[serde(default)]
     loot_loose: Vec<RawLoose>,
+    #[serde(default)]
+    loot_containers: Vec<RawContainer>,
     #[serde(default)]
     locks: Vec<RawLock>,
     #[serde(default)]
@@ -194,6 +214,53 @@ struct RawLoose {
     items: Vec<String>,
 }
 
+/// Свободный лут Лабы с шансами из базы SPT (`tools/spt-loot/build.py` → `assets/spt/labs_loose.json`).
+const SPT_LOOSE: &[u8] = include_bytes!("../assets/spt/labs_loose.json");
+/// Когда SPT последний раз обновлял таблицы лута Лабы — для подписи в интерфейсе.
+pub const SPT_DATE: &str = "SPT, март 2025";
+/// Точка tarkov.dev и место SPT считаются одним, если ближе этого (м по горизонтали).
+const MATCH_M: f64 = 1.0;
+
+/// Предметы, которые не показываем: ивентовые, в обычном рейде не встречаются.
+const EXCLUDED_ITEMS: &[&str] = &[
+    "655c67ab0d37ca5135388f4b", // фигурка «Дед Мороз» — новогодний ивент
+];
+
+/// Откуда точки свободного лута.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LootSource {
+    /// Точки и списки предметов tarkov.dev, шансы — из SPT (где нет — среднее по точке).
+    Tarkov,
+    /// Точки и шансы целиком из SPT: мест втрое больше, но среди них бывает и мусор.
+    Spt,
+}
+
+impl LootSource {
+    pub fn key(self) -> &'static str {
+        match self {
+            LootSource::Tarkov => "tarkov",
+            LootSource::Spt => "spt",
+        }
+    }
+    pub fn from_key(k: &str) -> Self {
+        if k == "spt" { LootSource::Spt } else { LootSource::Tarkov }
+    }
+}
+
+#[derive(Deserialize)]
+struct SptLoose {
+    points: Vec<SptPoint>,
+}
+
+#[derive(Deserialize)]
+struct SptPoint {
+    pos: [f64; 3],
+    /// Шанс, что на месте что-то появится за рейд.
+    p: f32,
+    /// (tpl, шанс предмета за рейд).
+    items: Vec<(String, f32)>,
+}
+
 #[derive(Deserialize)]
 struct RawLock {
     key: Option<String>,
@@ -237,11 +304,17 @@ impl Item {
     }
 }
 
+/// Место спавна свободного лута.
 #[derive(Clone, Debug)]
 pub struct LootPoint {
     pub pos: Pos,
     pub floor: usize,
-    pub items: Vec<String>,
+    /// Шанс, что здесь вообще что-то появится за рейд.
+    pub chance: f32,
+    /// (id предмета, шанс появления за рейд), по убыванию шанса.
+    pub items: Vec<(String, f32)>,
+    /// Предметы, у которых шанса в SPT нет и он взят средним (только для точек tarkov.dev).
+    pub guessed: Vec<String>,
     /// Индекс комнаты в `MapData::rooms`, если точка за запертой дверью.
     pub room: Option<usize>,
 }
@@ -269,6 +342,45 @@ pub struct Spawn {
     pub floor: usize,
 }
 
+/// Тип контейнера (ПК, ящик с инструментами, спортивная сумка…).
+/// Содержимое контейнеров tarkov.dev не публикует — только позиции.
+#[derive(Clone, Debug)]
+pub struct ContainerKind {
+    /// id шаблона контейнера.
+    pub id: String,
+    pub name: String,
+    pub icon: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct Container {
+    /// Индекс в `MapData::container_kinds`.
+    pub kind: usize,
+    pub pos: Pos,
+    pub floor: usize,
+    /// Индекс комнаты в `MapData::rooms`, если контейнер за запертой дверью.
+    pub room: Option<usize>,
+}
+
+/// Иконка контейнера по normalizedName из дампа.
+fn container_icon(slug: &str) -> &'static str {
+    match slug {
+        "pc-block" => "💻",
+        "drawer" => "🗄",
+        "toolbox" => "🧰",
+        "duffle-bag" => "👜",
+        "weapon-box" | "wooden-ammo-box" => "🔫",
+        "grenade-box" => "💣",
+        "medcase" | "medbag" | "medical-supply-crate" => "💊",
+        "jacket" => "🧥",
+        "safe" | "bank-safe" => "🔐",
+        "cash-register" | "bank-cash-register" => "💵",
+        "plastic-suitcase" => "💼",
+        s if s.ends_with("-body") || s == "dead-scav" => "💀",
+        _ => "📦",
+    }
+}
+
 /// Зачем предмет нужен: уровень убежища или задача.
 #[derive(Clone, Debug)]
 pub struct Need {
@@ -282,9 +394,13 @@ pub struct MapData {
     /// id карты (`maps::LAB`, `maps::LIGHTHOUSE`).
     pub map: &'static str,
     pub mode: Mode,
+    pub source: LootSource,
     pub fetched_at: Option<u64>,
     pub items: HashMap<String, Item>,
     pub loot: Vec<LootPoint>,
+    /// Типы контейнеров на карте: по убыванию количества.
+    pub container_kinds: Vec<ContainerKind>,
+    pub containers: Vec<Container>,
     pub locks: Vec<Lock>,
     pub extracts: Vec<Extract>,
     /// Где может появиться ЧВК.
@@ -317,8 +433,101 @@ fn translations(dir: &Path, file: &str, lang: Lang) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Читает кэш режима и собирает данные карты; названия из игры — на языке `lang`.
+/// Точки свободного лута выбранного источника. Предметы без цены (нет в дампе) и ивентовые — выкидываем.
+fn build_loot(
+    map: &str,
+    source: LootSource,
+    td: Vec<RawLoose>,
+    spt: Vec<SptPoint>,
+    items: &HashMap<String, Item>,
+    rooms: &[Room],
+) -> Vec<LootPoint> {
+    let keep = |id: &str| items.contains_key(id) && !EXCLUDED_ITEMS.contains(&id);
+    let point = |pos: Pos, chance: f32, mut list: Vec<(String, f32)>, guessed: Vec<String>| {
+        let floor = crate::maps::floor_of(map, pos);
+        list.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        LootPoint { pos, floor, chance, items: list, guessed, room: rooms.iter().position(|r| r.contains(pos, floor)) }
+    };
+    let spt_pos = |s: &SptPoint| Pos { x: s.pos[0], y: s.pos[1], z: s.pos[2] };
+
+    if source == LootSource::Spt {
+        return spt
+            .into_iter()
+            .filter_map(|s| {
+                let list: Vec<(String, f32)> = s.items.iter().filter(|(id, _)| keep(id)).cloned().collect();
+                (!list.is_empty()).then(|| point(spt_pos(&s), s.p, list, Vec::new()))
+            })
+            .collect();
+    }
+
+    // точки tarkov.dev: ближайшее место SPT (по горизонтали, этаж ±1,5 м) даёт шансы предметов
+    let nearest = |p: Pos| -> Option<&SptPoint> {
+        spt.iter()
+            .filter(|s| (s.pos[1] - p.y).abs() < 1.5)
+            .map(|s| ((s.pos[0] - p.x).hypot(s.pos[2] - p.z), s))
+            .filter(|(d, _)| *d < MATCH_M)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, s)| s)
+    };
+    struct Matched<'a> {
+        pos: Pos,
+        spot: Option<&'a SptPoint>,
+        found: Vec<(String, f32)>,
+        missing: Vec<String>,
+    }
+    let matched: Vec<Matched> = td
+        .into_iter()
+        .map(|l| {
+            let spot = nearest(l.position);
+            let mut ids: Vec<String> = l.items.into_iter().filter(|id| keep(id)).collect();
+            ids.sort();
+            ids.dedup();
+            let (mut found, mut missing) = (Vec::new(), Vec::new());
+            for id in ids {
+                match spot.and_then(|s| s.items.iter().find(|(t, _)| *t == id)) {
+                    Some((_, c)) => found.push((id, *c)),
+                    None => missing.push(id),
+                }
+            }
+            Matched { pos: l.position, spot, found, missing }
+        })
+        .collect();
+    // запасной шанс для точек совсем без пары в SPT — средний шанс предмета по карте
+    let all: Vec<f32> = matched.iter().flat_map(|m| m.found.iter().map(|(_, c)| *c)).collect();
+    let map_avg = if all.is_empty() { 0.01 } else { all.iter().sum::<f32>() / all.len() as f32 };
+
+    matched
+        .into_iter()
+        .filter_map(|m| {
+            // нет шанса в SPT — среднее по остальным предметам этой точки
+            let avg = if m.found.is_empty() {
+                map_avg
+            } else {
+                m.found.iter().map(|(_, c)| c).sum::<f32>() / m.found.len() as f32
+            };
+            let mut list = m.found;
+            list.extend(m.missing.iter().map(|id| (id.clone(), avg)));
+            if list.is_empty() {
+                return None;
+            }
+            let chance = match m.spot {
+                Some(s) => s.p,
+                // пары нет: шанс «хоть что-то» из шансов предметов
+                None => 1.0 - list.iter().map(|(_, c)| 1.0 - c).product::<f32>(),
+            };
+            Some(point(m.pos, chance, list, m.missing))
+        })
+        .collect()
+}
+
+/// Как `load_map_from`, с точками tarkov.dev. Для тестов.
+#[cfg(test)]
 pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData> {
+    load_map_from(mode, map, LootSource::Tarkov, lang)
+}
+
+/// Читает кэш режима и собирает данные карты с точками лута из `source`; названия из игры — на языке `lang`.
+pub fn load_map_from(mode: Mode, map: &'static str, source: LootSource, lang: Lang) -> Result<MapData> {
     let dir = data_dir().join(mode.dir());
     let items: Envelope<ItemsData> = read_json(&dir.join("items.json"))?;
     let names: Envelope<HashMap<String, String>> =
@@ -372,6 +581,7 @@ pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData>
     let map_names: HashMap<String, String> =
         maps.data.maps.iter().map(|(id, m)| (id.clone(), m.normalized_name.clone())).collect();
     let tasks = crate::tasks::load(&dir, &names.data, &map_names, lang);
+    let kinds_raw = maps.data.loot_containers;
     let lab = maps
         .data
         .maps
@@ -382,15 +592,13 @@ pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData>
     // зоны за дверями размечены только на Лабе
     let rooms = if map == crate::maps::LAB { labs::rooms() } else { Vec::new() };
     let floor_of = |p: Pos| crate::maps::floor_of(map, p);
-    let loot = lab
-        .loot_loose
-        .into_iter()
-        .map(|l| {
-            let floor = floor_of(l.position);
-            let room = rooms.iter().position(|r| r.contains(l.position, floor));
-            LootPoint { pos: l.position, floor, items: l.items, room }
-        })
-        .collect();
+    // шансы SPT собраны только для Лабы
+    let spt = if map == crate::maps::LAB {
+        serde_json::from_slice::<SptLoose>(SPT_LOOSE).context("assets/spt/labs_loose.json")?.points
+    } else {
+        Vec::new()
+    };
+    let loot = build_loot(map, source, lab.loot_loose, spt, &items, &rooms);
     let locks = lab
         .locks
         .into_iter()
@@ -398,6 +606,43 @@ pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData>
         .collect();
 
     let map_tr = translations(&dir, "maps", lang);
+
+    // контейнеры: типы по убыванию количества на карте
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for c in &lab.loot_containers {
+        *counts.entry(c.loot_container.as_str()).or_default() += 1;
+    }
+    let mut kind_ids: Vec<&str> = counts.keys().copied().collect();
+    kind_ids.sort_by(|a, b| counts[b].cmp(&counts[a]).then(a.cmp(b)));
+    let container_kinds: Vec<ContainerKind> = kind_ids
+        .iter()
+        .map(|id| {
+            let raw = kinds_raw.get(*id);
+            let name = raw
+                .and_then(|r| map_tr.get(&r.name))
+                .cloned()
+                .or_else(|| raw.map(|r| r.normalized_name.clone()))
+                .unwrap_or_else(|| id.to_string());
+            ContainerKind {
+                id: id.to_string(),
+                name,
+                icon: container_icon(raw.map(|r| r.normalized_name.as_str()).unwrap_or("")),
+            }
+        })
+        .collect();
+    let containers = lab
+        .loot_containers
+        .iter()
+        .map(|c| {
+            let floor = floor_of(c.position);
+            Container {
+                kind: kind_ids.iter().position(|k| *k == c.loot_container).unwrap_or(0),
+                pos: c.position,
+                floor,
+                room: rooms.iter().position(|r| r.contains(c.position, floor)),
+            }
+        })
+        .collect();
     let mut extracts: Vec<Extract> = lab
         .extracts
         .into_iter()
@@ -435,7 +680,22 @@ pub fn load_map_in(mode: Mode, map: &'static str, lang: Lang) -> Result<MapData>
 
     let needs = load_needs(&dir, lang);
 
-    Ok(MapData { map, mode, fetched_at, items, loot, locks, extracts, spawns, rooms, needs, tasks })
+    Ok(MapData {
+        map,
+        mode,
+        source,
+        fetched_at,
+        items,
+        loot,
+        container_kinds,
+        containers,
+        locks,
+        extracts,
+        spawns,
+        rooms,
+        needs,
+        tasks,
+    })
 }
 
 pub fn normalize(s: &str) -> String {
@@ -452,6 +712,21 @@ pub fn fmt_rub(v: i64) -> String {
         out.push(c);
     }
     format!("{}{out} ₽", if v < 0 { "-" } else { "" })
+}
+
+/// Шанс в процентах: 57 %, 2,2 %, 0,04 %.
+pub fn fmt_pct(p: f32) -> String {
+    let v = p * 100.0;
+    let s = if v >= 10.0 {
+        format!("{v:.0}")
+    } else if v >= 1.0 {
+        format!("{v:.1}")
+    } else if v >= 0.1 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    };
+    format!("{}%", s.replace('.', ","))
 }
 
 pub fn fmt_short(v: i64) -> String {

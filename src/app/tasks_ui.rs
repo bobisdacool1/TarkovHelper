@@ -153,6 +153,7 @@ impl HelperApp {
 
         // маркеры целей
         let mut n = 0usize;
+        let k = self.icon_k();
         for t in &shown {
             for (oi, p) in t.points_on(map) {
                 let floor = crate::maps::floor_of(map, p.pos);
@@ -177,9 +178,9 @@ impl HelperApp {
                     div()
                         .id(ElementId::named_usize("task-pt", n))
                         .absolute()
-                        .left(px(sx - 11.0))
-                        .top(px(sy - 11.0))
-                        .size(px(22.0))
+                        .left(px(sx - 11.0 * k))
+                        .top(px(sy - 11.0 * k))
+                        .size(px(22.0 * k))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -188,7 +189,7 @@ impl HelperApp {
                         .border_2()
                         .border_color(rgb(0x111111))
                         .shadow_md()
-                        .text_xs()
+                        .text_size(px(12.0 * k))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(0x111111))
                         .child(label)

@@ -1,7 +1,8 @@
 //! Оверлей после рейда: распознанный рюкзак → исключить лишнее → выбрать карту → подтвердить.
 //! Открывается хоткеем сканера (скан рюкзака под курсором, Windows) или с примером со страницы рейдов.
-//! Висит всегда, пока не подтвердишь или не отменишь: настройки удержания, таймера и
-//! скрытия при движении мыши из `ScannerSettings` на него не действуют.
+//! Висит, пока не подтвердишь, не отменишь или не кликнешь мимо (это тоже отмена, рейд не
+//! записывается): настройки удержания, таймера и скрытия при движении мыши из `ScannerSettings`
+//! на него не действуют.
 
 use gpui::{
     div, prelude::*, px, rgb, size, App, Bounds, Context, ElementId, Entity, FontWeight, SharedString,
@@ -59,6 +60,9 @@ pub struct RaidOverlay {
     log: Entity<RaidLog>,
     /// Это пример, а не настоящий скан.
     sample: bool,
+    /// Слежка за кликом мимо; кончается вместе с окном.
+    #[cfg(windows)]
+    outside: Option<crate::scanner::win::OutsideClicks>,
 }
 
 /// Пример: рюкзак со скриншота пользователя (распознан прототипом).
@@ -103,7 +107,17 @@ pub fn open(rows: Vec<Detected>, mode: String, log: Entity<RaidLog>, sample: boo
             window_background: gpui::WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        |_, cx| cx.new(|_| RaidOverlay { rows, map: None, mode, log, sample }),
+        |_, cx| {
+            cx.new(|_| RaidOverlay {
+                rows,
+                map: None,
+                mode,
+                log,
+                sample,
+                #[cfg(windows)]
+                outside: None,
+            })
+        },
     );
     if let Ok(handle) = handle {
         let _ = handle.update(cx, |_, window, _| keep_visible(window));
@@ -112,8 +126,37 @@ pub fn open(rows: Vec<Detected>, mode: String, log: Entity<RaidLog>, sample: boo
         #[cfg(windows)]
         if let Ok(Some(hwnd)) = handle.update(cx, |_, window, _| crate::scanner::win::window_hwnd(window)) {
             cx.spawn(async move |_| crate::scanner::win::set_topmost(hwnd)).detach();
+            close_on_outside_click(handle, hwnd, cx);
         }
+        // без хука мыши клик мимо виден только как потеря фокуса
+        #[cfg(not(windows))]
+        let _ = handle.update(cx, |_, window, cx| {
+            let mut was_active = window.is_window_active();
+            cx.observe_window_activation(window, move |_, window, _| {
+                let active = window.is_window_active();
+                if was_active && !active {
+                    window.remove_window();
+                }
+                was_active = active;
+            })
+            .detach();
+        });
     }
+}
+
+/// Клик мимо панели закрывает окно, как «Отмена».
+#[cfg(windows)]
+fn close_on_outside_click(handle: gpui::WindowHandle<RaidOverlay>, hwnd: isize, cx: &mut App) {
+    use futures::StreamExt;
+    let (watch, mut clicks) = crate::scanner::win::watch_outside_clicks(hwnd, OVERLAY_MARGIN);
+    let _ = handle.update(cx, |this, _, _| this.outside = Some(watch));
+    cx.spawn(async move |cx| {
+        // окно закрыли кнопкой — слежка снята, канал закрылся
+        if clicks.next().await.is_some() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    })
+    .detach();
 }
 
 /// Нативная донастройка окна оверлея. На macOS PopUp — это NSPanel: панели по умолчанию
@@ -290,13 +333,16 @@ impl Render for RaidOverlay {
                     .justify_between()
                     .child(
                         div()
+                            // подсказка переносится, а не выталкивает крестик
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .child(div().text_lg().font_weight(FontWeight::BOLD).text_color(rgb(GOLD)).child("ПОСЛЕ РЕЙДА"))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(if self.sample {
-                                "Пример с твоего скрина рюкзака. Сними галочки с того, что не надо считать."
+                                "Пример с твоего скрина рюкзака. Сними галочки с того, что не надо считать. Клик мимо окна — отмена."
                             } else {
-                                "Сними галочки с того, что не надо считать (своё снаряжение и т. п.)."
+                                "Сними галочки с того, что не надо считать (своё снаряжение и т. п.). Клик мимо окна — отмена."
                             })),
                     )
                     .child(

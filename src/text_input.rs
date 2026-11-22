@@ -76,6 +76,15 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Заменяет текст поля (курсор — в конец).
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.reset();
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        cx.emit(InputChanged);
+        cx.notify();
+    }
+
     fn clear_input(&mut self, _: &ClearInput, _: &mut Window, cx: &mut Context<Self>) {
         self.clear(cx);
     }

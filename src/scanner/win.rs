@@ -22,7 +22,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, MapVirtualKeyW, MAPVK_VK_TO_CHAR};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CallWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
+    CallNextHookEx, CallWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextW,
     PeekMessageW, PostThreadMessageW, SetWindowDisplayAffinity, SetWindowLongPtrW,
     SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, GWL_EXSTYLE, HC_ACTION, HHOOK,
     HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -235,6 +236,55 @@ struct Hooks {
     held: Mutex<Option<u32>>,
 }
 
+/// Окно, которому нужен клик мимо него.
+struct OutsideWatcher {
+    id: u32,
+    hwnd: isize,
+    /// Прозрачные поля окна (логические пиксели): клик по ним — тоже мимо.
+    margin: f32,
+    tx: UnboundedSender<()>,
+}
+
+static OUTSIDE: Mutex<Vec<OutsideWatcher>> = Mutex::new(Vec::new());
+static OUTSIDE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Пока жив — хук мыши следит за кликами мимо окна.
+pub struct OutsideClicks(u32);
+
+impl Drop for OutsideClicks {
+    fn drop(&mut self) {
+        OUTSIDE.lock().unwrap().retain(|w| w.id != self.0);
+        wake_hook_thread();
+    }
+}
+
+/// Клики мимо окна — в том числе по игре. Потери фокуса мало: открытое поверх игры окно
+/// его может и не получить, и терять будет нечего.
+pub fn watch_outside_clicks(hwnd: isize, margin: f32) -> (OutsideClicks, UnboundedReceiver<()>) {
+    let (tx, rx) = unbounded();
+    let id = OUTSIDE_ID.fetch_add(1, Ordering::SeqCst);
+    OUTSIDE.lock().unwrap().push(OutsideWatcher { id, hwnd, margin, tx });
+    wake_hook_thread();
+    (OutsideClicks(id), rx)
+}
+
+/// Точка вне прямоугольника окна, уменьшенного на поля `inset`.
+fn is_outside(r: RECT, inset: i32, p: POINT) -> bool {
+    !(r.left + inset..r.right - inset).contains(&p.x) || !(r.top + inset..r.bottom - inset).contains(&p.y)
+}
+
+fn report_outside_click(p: POINT) {
+    for w in OUTSIDE.lock().unwrap().iter() {
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(hwnd(w.hwnd), &mut r) }.is_ok() {
+            let inset = (w.margin * scale_of(w.hwnd)).round() as i32;
+            if is_outside(r, inset, p) {
+                let _ = w.tx.unbounded_send(());
+            }
+        }
+    }
+}
+
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 
@@ -369,6 +419,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code == HC_ACTION as i32 {
         if let Some(h) = HOOKS.get() {
             let m = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
+            // боковые кнопки не в счёт: на них хоткеи сканера
+            if matches!(wp.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+                report_outside_click(m.pt);
+            }
             let x2 = (m.mouseData >> 16) as u16 == 2;
             let button = match wp.0 as u32 {
                 WM_XBUTTONDOWN => Some((if x2 { "mouse5" } else { "mouse4" }, true)),
@@ -390,8 +444,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
-/// Запускает поток с хуками. Хук мыши ставится, только если в сочетаниях есть кнопка мыши:
-/// он вызывается на каждое движение мыши, а в игре это лишнее.
+/// Запускает поток с хуками. Хук мыши ставится, только если в сочетаниях есть кнопка мыши
+/// или открыто окно, которому нужен клик мимо него: он вызывается на каждое движение мыши,
+/// а в игре это лишнее.
 pub fn start_hooks() -> Option<UnboundedReceiver<HotkeyEvent>> {
     let (tx, rx) = unbounded();
     let hooks = Hooks {
@@ -414,7 +469,8 @@ pub fn start_hooks() -> Option<UnboundedReceiver<HotkeyEvent>> {
             let _keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinst, 0);
             let mut mouse: Option<HHOOK> = None;
             let sync_mouse = |mouse: &mut Option<HHOOK>| {
-                let need = HOOKS.get().is_some_and(|h| h.cfg.lock().unwrap().needs_mouse());
+                let need = !OUTSIDE.lock().unwrap().is_empty()
+                    || HOOKS.get().is_some_and(|h| h.cfg.lock().unwrap().needs_mouse());
                 if need && mouse.is_none() {
                     *mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0).ok();
                 } else if !need {
@@ -449,6 +505,11 @@ pub fn configure(cfg: HookConfig) {
     }
     h.down.lock().unwrap().clear();
     *h.held.lock().unwrap() = None;
+    wake_hook_thread();
+}
+
+/// Поток хуков перепроверит, нужен ли хук мыши.
+fn wake_hook_thread() {
     let tid = HOOK_THREAD.load(Ordering::SeqCst);
     if tid != 0 {
         unsafe {
@@ -560,6 +621,17 @@ mod tests {
 
     unsafe extern "system" fn plain_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         unsafe { DefWindowProcW(h, msg, wp, lp) }
+    }
+
+    #[test]
+    fn click_outside_panel() {
+        // второй монитор слева: координаты отрицательные
+        let r = RECT { left: -600, top: 100, right: -100, bottom: 800 };
+        let out = |x, y| is_outside(r, 20, POINT { x, y });
+        assert!(!out(-350, 400), "внутри панели");
+        assert!(!out(-580, 120) && !out(-121, 779), "край панели");
+        assert!(out(-590, 400) && out(-350, 790), "прозрачные поля");
+        assert!(out(50, 400) && out(-350, 900), "мимо окна");
     }
 
     /// Спрятанную карточку не показывает чужой `ShowWindow` (так GPUI реагирует на отключение

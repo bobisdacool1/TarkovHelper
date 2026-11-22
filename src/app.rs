@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::categories::GROUPS;
-use crate::data::{self, fmt_rub, fmt_short, Item, MapData, Mode};
+use crate::data::{self, fmt_pct, fmt_rub, fmt_short, Item, LootPoint, LootSource, MapData, Mode};
 use crate::labs::{key_color, point_in_poly};
 use crate::settings;
 use crate::tasks::Task;
@@ -25,9 +25,23 @@ const SIDEBAR_W: f32 = 400.0;
 const PAD: f32 = 16.0;
 const FLOOR_GAP: f32 = 160.0;
 /// Ключи сворачиваемых секций меню.
-const SECTIONS: [&str; 4] = ["price", "access", "loot", "loc"];
+const SECTIONS: [&str; 6] = ["presets", "price", "access", "loot", "cont", "loc"];
+/// Сколько предметов категории показывать сразу (и сколько добавляет «ещё»): длинные списки тормозят.
+const GROUP_PAGE: usize = 40;
 
+/// Пороги средней суммы точки за рейд.
+const EV_THRESHOLDS: [i64; 6] = [0, 1_000, 5_000, 10_000, 20_000, 50_000];
+/// Классический вид: пороги цены предмета.
 const THRESHOLDS: [i64; 7] = [0, 50_000, 100_000, 200_000, 300_000, 500_000, 1_000_000];
+
+/// Вид карты лута.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LootView {
+    /// Как раньше: на маркере самое ценное на точке, фильтр «Дороже N» по цене предмета.
+    Classic,
+    /// Шансы SPT и средняя сумма точки за рейд, фильтр по ней.
+    Chances,
+}
 
 // палитра в духе mapgenie: тёмная панель, золото, кремовый текст
 pub(crate) const BG: u32 = 0x111111;
@@ -139,9 +153,21 @@ pub struct HelperApp {
     geo: Option<Geo>,
     /// Картинки этажей (с дорисованными комнатами).
     floor_images: Vec<FloorImage>,
+    /// Минимальная средняя сумма точки за рейд.
+    min_ev: i64,
+    /// Откуда точки свободного лута (в виде «шансы»).
+    loot_source: LootSource,
+    loot_view: LootView,
+    /// Классический вид: предметы дороже этого.
     threshold: i64,
     search: String,
     search_input: Entity<TextInput>,
+    /// Пресеты фильтров и поле имени нового пресета.
+    presets: Vec<settings::FilterPreset>,
+    preset_input: Entity<TextInput>,
+    naming_preset: bool,
+    /// Сколько предметов показано в раскрытой категории.
+    group_limit: HashMap<usize, usize>,
     hidden_items: HashSet<String>,
     hidden_groups: HashSet<usize>,
     /// Скрытый доступ: None — лут без ключа, Some(id) — за дверью с этим ключом.
@@ -155,8 +181,12 @@ pub struct HelperApp {
     show_rooms: bool,
     show_extracts: bool,
     show_spawns: bool,
+    /// Показанные типы контейнеров (id шаблона).
+    shown_containers: HashSet<String>,
     /// Автообновление цен: при старте, если данные старше часа, и каждые 30 минут.
     auto_refresh: bool,
+    /// Размер иконок на карте, %.
+    icon_size: u32,
     /// Проверять обновления приложения при запуске.
     auto_update_check: bool,
     /// Открытый раздел приложения.
@@ -212,9 +242,31 @@ struct Hover {
 /// Точка лута, прошедшая фильтры.
 struct Visible {
     idx: usize,
+    /// Средняя сумма за рейд по видимым предметам.
+    ev: i64,
+    /// Цена самого ценного видимого предмета.
     best: i64,
+    /// Предмет для маркера: в классическом виде — самый ценный, в «шансах» — с наибольшим вкладом.
     top_item: String,
-    items: Vec<String>,
+    /// (id, шанс за рейд): в классическом виде по цене, в «шансах» — по вкладу.
+    items: Vec<(String, f32)>,
+}
+
+/// Сколько штук предмета в среднем появляется за рейд: «~0,25 шт».
+fn fmt_per_raid(x: f32) -> String {
+    let s = if x >= 0.01 { format!("{x:.2}") } else { format!("{x:.3}") };
+    format!("~{} шт", s.replace('.', ","))
+}
+
+/// Цвет маркера по средней сумме точки за рейд.
+fn ev_color(ev: i64) -> u32 {
+    match ev {
+        v if v >= 50_000 => 0xff5252,
+        v if v >= 20_000 => 0xffa726,
+        v if v >= 10_000 => 0xba68c8,
+        v if v >= 5_000 => 0x42a5f5,
+        _ => 0x9e9e9e,
+    }
 }
 
 struct Tip(SharedString);
@@ -265,7 +317,8 @@ impl HelperApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| TextInput::new("Поиск… (ledx, черная, -плакат)", cx));
         cx.subscribe(&search_input, |this, input, _: &InputChanged, cx| {
-            this.search = input.read(cx).text().to_string();
+            // храним сразу нормализованным: фильтр зовётся на каждый предмет каждой точки
+            this.search = data::normalize(input.read(cx).text().trim());
             this.selected_point = None;
             cx.notify();
         })
@@ -289,9 +342,16 @@ impl HelperApp {
             data: None,
             geo: None,
             floor_images: Vec::new(),
+            min_ev: st.min_ev,
+            loot_source: LootSource::from_key(&st.loot_source),
+            loot_view: if st.loot_view == "chances" { LootView::Chances } else { LootView::Classic },
             threshold: st.threshold,
             search: String::new(),
             search_input: search_input.clone(),
+            presets: st.presets.clone(),
+            preset_input: cx.new(|cx| TextInput::new("Название фильтра", cx)),
+            naming_preset: false,
+            group_limit: HashMap::new(),
             hidden_items: st.hidden_items.iter().cloned().collect(),
             hidden_groups: st.hidden_groups.iter().copied().collect(),
             hidden_access: st
@@ -306,8 +366,10 @@ impl HelperApp {
             show_rooms: st.show_rooms,
             show_extracts: st.show_extracts,
             show_spawns: st.show_spawns,
+            shown_containers: st.shown_containers.iter().cloned().collect(),
             auto_refresh: st.auto_refresh,
             auto_update_check: st.auto_update_check,
+            icon_size: settings::icon_size(st.icon_size),
             section: match st.section.as_str() {
                 "tasks" => Section::Tasks,
                 "scanner" => Section::Scanner,
@@ -421,6 +483,9 @@ impl HelperApp {
         settings::Settings {
             mode: if self.mode == Mode::Pvp { "pvp" } else { "pve" }.into(),
             lang: crate::lang::get().code().into(),
+            min_ev: self.min_ev,
+            loot_source: self.loot_source.key().into(),
+            loot_view: if self.loot_view == LootView::Chances { "chances" } else { "classic" }.into(),
             threshold: self.threshold,
             hidden_items: self.hidden_items.iter().cloned().collect(),
             hidden_groups: self.hidden_groups.iter().copied().collect(),
@@ -432,8 +497,10 @@ impl HelperApp {
             show_rooms: self.show_rooms,
             show_extracts: self.show_extracts,
             show_spawns: self.show_spawns,
+            shown_containers: self.shown_containers.iter().cloned().collect(),
             auto_refresh: self.auto_refresh,
             auto_update_check: self.auto_update_check,
+            icon_size: self.icon_size,
             section: match self.section {
                 Section::Maps => "maps",
                 Section::Tasks => "tasks",
@@ -444,6 +511,8 @@ impl HelperApp {
             .into(),
             map: self.map.into(),
             scanner: self.scanner.clone(),
+            presets: self.presets.clone(),
+            cases_split: true,
         }
     }
 
@@ -458,8 +527,7 @@ impl HelperApp {
 
     /// Загружает данные режима (из кэша или скачивает дамп) и готовит подложку.
     fn load(&mut self, force_download: bool, cx: &mut Context<Self>) {
-        let mode = self.mode;
-        let map = self.map;
+        let (mode, map, source) = (self.mode, self.map, self.source());
         let need_download = force_download || !data::has_dump(mode);
         self.status = Status::Busy(if need_download {
             format!("Скачиваю дамп {}…", mode.label())
@@ -478,7 +546,7 @@ impl HelperApp {
                         data::download_dump(mode)?;
                         crate::labs::refresh_rooms_from_repo();
                     }
-                    let lab = data::load_map_in(mode, map, lang)?;
+                    let lab = data::load_map_from(mode, map, source, lang)?;
                     let (geo, paths) = tiles::prepare(&lab)?;
                     // при обновлении цен картинки те же — не декодируем заново
                     let images = paths
@@ -495,7 +563,10 @@ impl HelperApp {
                 let mut refresh_after = false;
                 match result {
                     Ok((lab, geo, images))
-                        if lab.mode == this.mode && lab.map == this.map && lang == crate::lang::get() =>
+                        if lab.mode == this.mode
+                            && lab.map == this.map
+                            && lab.source == this.source()
+                            && lang == crate::lang::get() =>
                     {
                         eprintln!(
                             "tarkov-helper: данные {} ({}) за {} мс",
@@ -559,6 +630,37 @@ impl HelperApp {
         crate::maps::floor_titles(self.map)
     }
 
+    /// Множитель размера маркеров карты.
+    fn icon_k(&self) -> f32 {
+        self.icon_size as f32 / 100.0
+    }
+
+    /// Вид лута на текущей карте: шансы SPT есть только у Лабы, на остальных — классический.
+    fn view(&self) -> LootView {
+        if self.map == crate::maps::LAB { self.loot_view } else { LootView::Classic }
+    }
+
+    /// Откуда точки лута сейчас: классический вид — всегда tarkov.dev.
+    fn source(&self) -> LootSource {
+        match self.view() {
+            LootView::Classic => LootSource::Tarkov,
+            LootView::Chances => self.loot_source,
+        }
+    }
+
+    /// Меняет вид или источник точек; перечитывает данные, если сменился источник.
+    fn set_loot_view(&mut self, view: LootView, source: LootSource, cx: &mut Context<Self>) {
+        let before = self.source();
+        self.loot_view = view;
+        self.loot_source = source;
+        self.selected_point = None;
+        self.hover = None;
+        if self.source() != before {
+            self.load(false, cx);
+        }
+        cx.notify();
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;
@@ -575,16 +677,62 @@ impl HelperApp {
         }
     }
 
+    // ---------- пресеты фильтров ----------
+
+    /// Текущие фильтры как пресет с именем `name`.
+    fn snapshot(&self, name: String, cx: &App) -> settings::FilterPreset {
+        settings::FilterPreset {
+            name,
+            threshold: self.threshold,
+            min_ev: self.min_ev,
+            search: self.search_input.read(cx).text().trim().to_string(),
+            hidden_items: self.hidden_items.iter().cloned().collect(),
+            hidden_groups: self.hidden_groups.iter().copied().collect(),
+            hidden_access: self.hidden_access.iter().map(|k| k.clone().unwrap_or_default()).collect(),
+        }
+    }
+
+    /// Пресет совпадает с текущими фильтрами (подсвечиваем его кнопку).
+    fn preset_active(&self, p: &settings::FilterPreset, cx: &App) -> bool {
+        self.snapshot(p.name.clone(), cx) == *p
+    }
+
+    fn apply_preset(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(p) = self.presets.get(i).cloned() else { return };
+        self.min_ev = p.min_ev;
+        self.threshold = p.threshold;
+        self.hidden_items = p.hidden_items.into_iter().collect();
+        self.hidden_groups = p.hidden_groups.into_iter().collect();
+        self.hidden_access = p.hidden_access.into_iter().map(|k| if k.is_empty() { None } else { Some(k) }).collect();
+        self.selected_point = None;
+        let search = p.search;
+        self.search_input.update(cx, |input, cx| input.set_text(search, cx));
+        cx.notify();
+    }
+
+    /// Сохраняет текущие фильтры под именем из поля; то же имя — перезаписывает.
+    fn save_preset(&mut self, cx: &mut Context<Self>) {
+        let typed = self.preset_input.read(cx).text().trim().to_string();
+        let name = if typed.is_empty() { format!("Фильтр {}", self.presets.len() + 1) } else { typed };
+        let preset = self.snapshot(name.clone(), cx);
+        match self.presets.iter_mut().find(|p| p.name == name) {
+            Some(p) => *p = preset,
+            None => self.presets.push(preset),
+        }
+        self.naming_preset = false;
+        self.preset_input.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+    }
+
     // ---------- фильтры ----------
 
-    /// Проходит порог цены и поиск (без учёта категорий и ручного скрытия).
+    /// Проходит поиск и, в классическом виде, порог цены (без учёта категорий и ручного скрытия).
     fn matches_base(&self, item: &Item) -> bool {
-        if item.price() < self.threshold {
+        if self.view() == LootView::Classic && item.price() < self.threshold {
             return false;
         }
         // слова через пробел должны все совпасть; "-слово" исключает
-        let q = data::normalize(self.search.trim());
-        q.split_whitespace().all(|w| match w.strip_prefix('-') {
+        self.search.split_whitespace().all(|w| match w.strip_prefix('-') {
             Some("") => true,
             Some(neg) => !item.search.contains(neg),
             None => item.search.contains(w),
@@ -621,7 +769,56 @@ impl HelperApp {
         })
     }
 
+    /// Id предметов, прошедших фильтр, — считаем один раз на кадр, а не на каждую точку.
+    fn ids_where<'a>(d: &'a MapData, keep: impl Fn(&Item) -> bool) -> HashSet<&'a str> {
+        d.items.values().filter(|i| keep(i)).map(|i| i.id.as_str()).collect()
+    }
+
+    /// Средняя сумма точки за рейд по предметам из `keep`; None — таких предметов на точке нет.
+    fn point_ev(d: &MapData, p: &LootPoint, keep: &HashSet<&str>) -> Option<i64> {
+        let mut any = false;
+        let mut ev = 0.0f64;
+        for (id, c) in &p.items {
+            if keep.contains(id.as_str()) {
+                any = true;
+                ev += *c as f64 * d.items[id].price() as f64;
+            }
+        }
+        any.then_some(ev.round() as i64)
+    }
+
+    /// Проходит ли точка фильтр и сколько она «стоит» для сумм в меню: в классическом виде —
+    /// сумма цен видимых предметов, в виде «шансы» — средняя сумма за рейд не ниже порога.
+    fn point_pass(&self, d: &MapData, p: &LootPoint, keep: &HashSet<&str>) -> Option<i64> {
+        match self.view() {
+            LootView::Classic => {
+                let mut ids: Vec<&str> = p.items.iter().map(|(id, _)| id.as_str()).filter(|id| keep.contains(id)).collect();
+                ids.dedup();
+                (!ids.is_empty()).then(|| ids.iter().map(|id| d.items[*id].price()).sum::<i64>())
+            }
+            LootView::Chances => Self::point_ev(d, p, keep).filter(|ev| *ev >= self.min_ev.max(1)),
+        }
+    }
+
+    /// Средняя сумма точки за рейд по предметам, прошедшим фильтр, и сами предметы
+    /// (id, шанс) по убыванию вклада шанс × цена.
+    fn point_value<'a>(d: &'a MapData, p: &'a LootPoint, keep: impl Fn(&Item) -> bool) -> (i64, Vec<(&'a str, f32)>) {
+        let mut items: Vec<(&str, f32, f64)> = p
+            .items
+            .iter()
+            .filter_map(|(id, c)| {
+                let it = d.items.get(id)?;
+                keep(it).then_some((id.as_str(), *c, *c as f64 * it.price() as f64))
+            })
+            .collect();
+        items.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(b.0)));
+        let ev = items.iter().map(|x| x.2).sum::<f64>().round() as i64;
+        (ev, items.into_iter().map(|(id, c, _)| (id, c)).collect())
+    }
+
+    /// Точки, прошедшие доступ, фильтры предметов и порог средней суммы.
     fn visible_points(&self, d: &MapData) -> Vec<Visible> {
+        let shown = Self::ids_where(d, |i| self.is_shown(i));
         d.loot
             .iter()
             .enumerate()
@@ -629,19 +826,20 @@ impl HelperApp {
                 if self.access_hidden(d, idx) {
                     return None;
                 }
-                let mut items: Vec<String> = p
-                    .items
-                    .iter()
-                    .filter(|id| d.items.get(*id).is_some_and(|i| self.is_shown(i)))
-                    .cloned()
-                    .collect();
-                if items.is_empty() {
-                    return None;
+                // дешёвая проверка фильтра, сортируем только прошедшие
+                self.point_pass(d, p, &shown)?;
+                let (ev, mut items) = Self::point_value(d, p, |i| shown.contains(i.id.as_str()));
+                if self.view() == LootView::Classic {
+                    // как раньше: по цене, первым — самое ценное
+                    items.sort_by(|a, b| d.items[b.0].price().cmp(&d.items[a.0].price()).then(a.0.cmp(b.0)));
                 }
-                items.sort_by(|a, b| d.items[b].price().cmp(&d.items[a].price()).then(a.cmp(b)));
-                items.dedup();
-                let best = d.items[&items[0]].price();
-                Some(Visible { idx, best, top_item: items[0].clone(), items })
+                Some(Visible {
+                    idx,
+                    ev,
+                    best: d.items[items.iter().max_by_key(|(id, _)| d.items[*id].price())?.0].price(),
+                    top_item: items[0].0.to_string(),
+                    items: items.into_iter().map(|(id, c)| (id.to_string(), c)).collect(),
+                })
             })
             .collect()
     }
@@ -891,6 +1089,7 @@ impl HelperApp {
                 }
             }
 
+            let k = self.icon_k();
             if self.show_doors {
                 for (li, lock) in d.locks.iter().enumerate().filter(|(_, l)| self.floor_visible(l.floor)) {
                     let (sx, sy) = self.to_screen(lock.floor, lock.pos.x, lock.pos.z);
@@ -909,22 +1108,22 @@ impl HelperApp {
                         div()
                             .id(ElementId::named_usize("lock", li))
                             .absolute()
-                            .left(px(sx - 10.0))
-                            .top(px(sy - 10.0))
-                            .h(px(20.0))
+                            .left(px(sx - 10.0 * k))
+                            .top(px(sy - 10.0 * k))
+                            .h(px(20.0 * k))
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .px(px(4.0))
+                            .gap(px(4.0 * k))
+                            .px(px(4.0 * k))
                             .rounded_md()
                             .bg(rgb(color))
                             .border_1()
                             .border_color(rgb(if dark { 0xe0e0e0 } else { 0x111111 }))
                             .when(dark, |el| el.border_2())
                             .shadow_md()
-                            .child(svg().flex_none().path("icons/lock.svg").size(px(12.0)).text_color(rgb(fg)))
+                            .child(svg().flex_none().path("icons/lock.svg").size(px(12.0 * k)).text_color(rgb(fg)))
                             .when(label, |el| {
-                                el.child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(fg)).child(short))
+                                el.child(div().text_size(px(12.0 * k)).font_weight(FontWeight::BOLD).text_color(rgb(fg)).child(short))
                             })
                             .on_hover(Self::hover_listener(format!("lock{li}"), lines, lock.floor, lock.pos.x, lock.pos.z, cx))
                             .into_any_element(),
@@ -943,9 +1142,9 @@ impl HelperApp {
                         div()
                             .id(ElementId::named_usize("spawn", si))
                             .absolute()
-                            .left(px(sx - 9.0))
-                            .top(px(sy - 9.0))
-                            .size(px(18.0))
+                            .left(px(sx - 9.0 * k))
+                            .top(px(sy - 9.0 * k))
+                            .size(px(18.0 * k))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -954,7 +1153,7 @@ impl HelperApp {
                             .border_1()
                             .border_color(rgb(0x111111))
                             .shadow_md()
-                            .child(svg().path("icons/spawn.svg").size(px(12.0)).text_color(rgb(0x111111)))
+                            .child(svg().path("icons/spawn.svg").size(px(12.0 * k)).text_color(rgb(0x111111)))
                             .on_hover(Self::hover_listener(format!("spawn{si}"), lines, sp.floor, sp.pos.x, sp.pos.z, cx))
                             .into_any_element(),
                     );
@@ -974,22 +1173,22 @@ impl HelperApp {
                         div()
                             .id(ElementId::named_usize("exit", ei))
                             .absolute()
-                            .left(px(sx - 12.0))
-                            .top(px(sy - 12.0))
-                            .h(px(24.0))
+                            .left(px(sx - 12.0 * k))
+                            .top(px(sy - 12.0 * k))
+                            .h(px(24.0 * k))
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .px(px(5.0))
+                            .gap(px(4.0 * k))
+                            .px(px(5.0 * k))
                             .rounded_md()
                             .bg(rgb(color))
                             .border_1()
                             .border_color(rgb(0xffffff))
                             .shadow_md()
-                            .child(svg().flex_none().path(icon).size(px(14.0)).text_color(rgb(0xffffff)))
+                            .child(svg().flex_none().path(icon).size(px(14.0 * k)).text_color(rgb(0xffffff)))
                             // переходов на карте 1–4 — куда ведут, видно при любом зуме
                             .when(s > 0.15 || ex.faction == "transit", |el| {
-                                el.child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child(ex.name.clone()))
+                                el.child(div().text_size(px(12.0 * k)).font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child(ex.name.clone()))
                             })
                             .on_hover(Self::hover_listener(
                                 format!("exit{ei}"),
@@ -1009,6 +1208,47 @@ impl HelperApp {
                 self.task_layers(&d, &mut layers, cx);
             }
 
+            // контейнеры — под точками лута: открытый лут важнее
+            if !tasks_view && !self.shown_containers.is_empty() {
+                for (ci, c) in d.containers.iter().enumerate() {
+                    let kind = &d.container_kinds[c.kind];
+                    if !self.floor_visible(c.floor) || !self.shown_containers.contains(&kind.id) {
+                        continue;
+                    }
+                    let access = c.room.map(|r| d.rooms[r].key.clone());
+                    if !d.rooms.is_empty() && self.hidden_access.contains(&access) {
+                        continue;
+                    }
+                    let (sx, sy) = self.to_screen(c.floor, c.pos.x, c.pos.z);
+                    let mut lines = vec![kind.name.clone()];
+                    lines.extend(Some(floors[c.floor]).filter(|t| !t.is_empty()).map(String::from));
+                    if let Some(r) = c.room {
+                        lines.push(format!("🔒 нужна {}", d.item_short(&d.rooms[r].key)));
+                    }
+                    let size = 18.0 * k;
+                    layers.push(
+                        div()
+                            .id(ElementId::named_usize("cont", ci))
+                            .absolute()
+                            .left(px(sx - size / 2.0))
+                            .top(px(sy - size / 2.0))
+                            .size(px(size))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .bg(rgb(CARD))
+                            .border_1()
+                            .border_color(rgb(GOLD_DIM))
+                            .shadow_md()
+                            .text_size(px(size * 0.6))
+                            .child(kind.icon)
+                            .on_hover(Self::hover_listener(format!("cont{ci}"), lines, c.floor, c.pos.x, c.pos.z, cx))
+                            .into_any_element(),
+                    );
+                }
+            }
+
             for v in self.visible_points(&d).into_iter().filter(|_| !tasks_view) {
                 let p = &d.loot[v.idx];
                 if !self.floor_visible(p.floor) {
@@ -1017,19 +1257,35 @@ impl HelperApp {
                 let (sx, sy) = self.to_screen(p.floor, p.pos.x, p.pos.z);
                 let selected = self.selected_point == Some(v.idx);
                 let top = &d.items[&v.top_item];
-                let mut lines: Vec<String> = v
-                    .items
-                    .iter()
-                    .map(|id| {
+                let classic = self.view() == LootView::Classic;
+                let mut lines = Vec::new();
+                if classic {
+                    // как раньше: все видимые предметы точки по цене
+                    lines.extend(v.items.iter().map(|(id, _)| {
                         let it = &d.items[id];
                         format!("{} — {}", it.short, fmt_short(it.price()))
-                    })
-                    .collect();
+                    }));
+                } else {
+                    const HOVER_ITEMS: usize = 6;
+                    lines.push(format!("~{} за рейд · что-то есть в {} рейдов", fmt_short(v.ev), fmt_pct(p.chance)));
+                    if let Some((id, c)) = v.items.iter().max_by_key(|(id, _)| d.items[id].price()) {
+                        let it = &d.items[id];
+                        lines.push(format!("Самое ценное: {} {} — {}", it.short, fmt_short(it.price()), fmt_pct(*c)));
+                    }
+                    lines.extend(v.items.iter().take(HOVER_ITEMS).map(|(id, c)| {
+                        let it = &d.items[id];
+                        let approx = if p.guessed.contains(id) { "≈" } else { "" };
+                        format!("{} {approx}{} — {}", it.short, fmt_pct(*c), fmt_short(it.price()))
+                    }));
+                    if v.items.len() > HOVER_ITEMS {
+                        lines.push(format!("ещё {} — по клику", v.items.len() - HOVER_ITEMS));
+                    }
+                }
                 if let Some(r) = p.room {
                     lines.push(format!("🔒 нужна {}", d.item_short(&d.rooms[r].key)));
                 }
                 let idx = v.idx;
-                let size = if selected { 26.0 } else { 20.0 };
+                let size = if selected { 26.0 } else { 20.0 } * k;
                 layers.push(
                     div()
                         .id(ElementId::named_usize("pt", idx))
@@ -1041,7 +1297,7 @@ impl HelperApp {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .bg(rgb(tier_color(v.best)))
+                        .bg(rgb(if classic { tier_color(v.best) } else { ev_color(v.ev) }))
                         .border_2()
                         .border_color(rgb(if selected { 0xffffff } else { 0x161616 }))
                         .shadow_md()
@@ -1067,7 +1323,11 @@ impl HelperApp {
                             .bg(with_alpha(0x000000, 0xb0))
                             .text_xs()
                             .text_color(rgb(TEXT))
-                            .child(format!("{} {}", top.short, fmt_short(top.price())))
+                            .child(if classic {
+                                format!("{} {}", top.short, fmt_short(top.price()))
+                            } else {
+                                format!("~{} · {}", fmt_short(v.ev), top.short)
+                            })
                             .into_any_element(),
                     );
                 }
@@ -1078,8 +1338,8 @@ impl HelperApp {
                 layers.push(
                     div()
                         .absolute()
-                        .left(px(sx + 16.0))
-                        .top(px(sy + 12.0))
+                        .left(px(sx + 16.0 * k))
+                        .top(px(sy + 12.0 * k))
                         .flex()
                         .flex_col()
                         .px_2()
@@ -1099,7 +1359,7 @@ impl HelperApp {
             if let Some(pi) = self.selected_point.filter(|_| !tasks_view) {
                 let p = &d.loot[pi];
                 let (sx, sy) = self.to_screen(p.floor, p.pos.x, p.pos.z);
-                layers.push(self.render_popup(&d, pi, sx + 18.0, sy - 20.0, cx).into_any_element());
+                layers.push(self.render_popup(&d, pi, sx + 18.0 * k, sy - 20.0, cx).into_any_element());
             }
         }
 
@@ -1234,16 +1494,21 @@ impl HelperApp {
     /// Карточка выбранной точки рядом с маркером.
     fn render_popup(&self, d: &MapData, pi: usize, x: f32, y: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = &d.loot[pi];
-        let mut items: Vec<&Item> = p.items.iter().filter_map(|id| d.items.get(id)).collect();
-        items.sort_by_key(|i| -i.price());
-        items.dedup_by_key(|i| i.id.clone());
+        let classic = self.view() == LootView::Classic;
+        let (ev_all, mut all) = Self::point_value(d, p, |_| true);
+        let (ev_shown, _) = Self::point_value(d, p, |i| self.is_shown(i));
+        if classic {
+            // как раньше: по цене, без шансов
+            all.sort_by(|a, b| d.items[b.0].price().cmp(&d.items[a.0].price()).then(a.0.cmp(b.0)));
+        }
+        const POPUP_ITEMS: usize = 20;
 
         let mut card = div()
             .id("popup")
             .absolute()
             .left(px(x))
             .top(px(y))
-            .w(px(300.0))
+            .w(px(360.0))
             .bg(rgb(PANEL))
             .border_1()
             .border_color(rgb(GOLD_DIM))
@@ -1284,6 +1549,34 @@ impl HelperApp {
                             })),
                     ),
             );
+        card = card.when(!classic, |card| card.child(
+            div()
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(rgb(GOLD_DIM))
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(
+                    div().text_sm().text_color(rgb(ev_color(ev_shown))).child(format!(
+                        "~{} за рейд{}",
+                        fmt_short(ev_shown),
+                        if ev_shown != ev_all { format!(" (всего ~{})", fmt_short(ev_all)) } else { String::new() }
+                    )),
+                )
+                .when_some(all.iter().max_by_key(|(id, _)| d.items[*id].price()), |el, (id, c)| {
+                    let it = &d.items[*id];
+                    el.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("Самое ценное: {} {} — {}", it.short, fmt_short(it.price()), fmt_pct(*c))),
+                    )
+                })
+                .child(format!("Что-то есть в {} рейдов · шансы за рейд, {}", fmt_pct(p.chance), data::SPT_DATE)),
+        ));
         if let Some(r) = p.room {
             let room = &d.rooms[r];
             card = card.child(
@@ -1305,7 +1598,9 @@ impl HelperApp {
             );
         }
         let mut list = div().flex().flex_col().px_3().py_2().gap_1();
-        for it in items {
+        let more = all.len().saturating_sub(POPUP_ITEMS);
+        for (id, chance) in all.into_iter().take(POPUP_ITEMS) {
+            let it = &d.items[id];
             let hit = self.is_shown(it);
             list = list.child(
                 div()
@@ -1316,8 +1611,16 @@ impl HelperApp {
                     .text_color(rgb(if hit { TEXT } else { MUTED }))
                     .child(div().w(px(18.0)).child(GROUPS[it.group].icon))
                     .child(div().flex_1().child(it.short.clone()))
+                    .when(!classic, |row| {
+                        row.child(div().w(px(54.0)).text_xs().text_color(rgb(MUTED)).child(format!(
+                            "{}{}",
+                            if p.guessed.iter().any(|g| g == id) { "≈" } else { "" },
+                            fmt_pct(chance)
+                        )))
+                    })
                     .child(
                         div()
+                            .w(px(44.0))
                             .text_color(rgb(if hit { tier_color(it.price()) } else { MUTED }))
                             .child(fmt_short(it.price())),
                     )
@@ -1344,6 +1647,9 @@ impl HelperApp {
                             }))
                     }),
             );
+        }
+        if more > 0 {
+            list = list.child(div().text_xs().text_color(rgb(MUTED)).child(format!("…и ещё {more} предметов с меньшим вкладом")));
         }
         card.child(list)
     }
@@ -1387,6 +1693,100 @@ impl HelperApp {
                         this.search_input.update(cx, |input, cx| input.clear(cx));
                     })),
             )
+    }
+
+    /// «Мои фильтры»: кнопки пресетов, сохранение текущих фильтров под именем.
+    fn render_presets(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = !self.collapsed.contains("presets");
+        let mut sec = div().flex().flex_col().child(section_with_links(
+            "sec-presets",
+            "Мои фильтры",
+            open,
+            Self::toggle_section("presets", cx),
+            link("preset-new", "+ сохранить текущие", cx.listener(|this, _, window, cx| {
+                this.naming_preset = true;
+                this.collapsed.remove("presets");
+                window.focus(&this.preset_input.focus_handle(cx));
+                cx.notify();
+            })),
+            div(),
+        ));
+        if !open {
+            return sec;
+        }
+        if self.presets.is_empty() && !self.naming_preset {
+            sec = sec.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Сохрани галочки, порог, доступ и поиск под своим именем — и переключайся одной кнопкой."),
+            );
+        }
+        sec = sec.child(div().flex().flex_wrap().gap_1().children(self.presets.iter().enumerate().map(|(i, p)| {
+            div()
+                .flex()
+                .items_center()
+                .child(segmented(
+                    ElementId::named_usize("preset", i),
+                    p.name.clone(),
+                    self.preset_active(p, cx),
+                    cx.listener(move |this, _, _, cx| this.apply_preset(i, cx)),
+                ))
+                .child(
+                    div()
+                        .id(ElementId::named_usize("preset-del", i))
+                        .px_1()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(0xff6b6b)))
+                        .tooltip(tip("Удалить фильтр"))
+                        .child("✕")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if i < this.presets.len() {
+                                this.presets.remove(i);
+                            }
+                            cx.notify();
+                        })),
+                )
+        })));
+        if self.naming_preset {
+            let focused = self.preset_input.focus_handle(cx).is_focused(window);
+            sec = sec.child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| match ev.keystroke.key.as_str() {
+                        "enter" => this.save_preset(cx),
+                        "escape" => {
+                            this.naming_preset = false;
+                            cx.notify();
+                        }
+                        _ => {}
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .px_2()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(if focused { GOLD } else { GOLD_DIM }))
+                            .text_color(rgb(TEXT))
+                            .child(self.preset_input.clone()),
+                    )
+                    .child(segmented("preset-save", "Сохранить", true, cx.listener(|this, _, _, cx| this.save_preset(cx))))
+                    .child(link("preset-cancel", "отмена", cx.listener(|this, _, _, cx| {
+                        this.naming_preset = false;
+                        cx.notify();
+                    }))),
+            );
+        }
+        sec
     }
 
     /// Строка категории в две колонки, как на mapgenie: иконка, название, счётчик.
@@ -1562,36 +1962,66 @@ impl HelperApp {
             }
         }
         col = col.child(self.render_search(window, cx));
+        col = col.child(self.render_presets(window, cx));
 
-        // порог цены
-        col = col.child(section_with_links("sec-price", "Дороже", open_price, Self::toggle_section("price", cx), div(), div())).when(open_price, |c| c.child(
-            div().flex().flex_wrap().gap_1().children(THRESHOLDS.iter().map(|&t| {
-                segmented(
-                    ElementId::named_usize("thr", t as usize),
-                    if t == 0 { "весь лут".to_string() } else { fmt_short(t) },
-                    self.threshold == t,
-                    cx.listener(move |this, _, _, cx| {
-                        this.threshold = t;
-                        cx.notify();
-                    }),
-                )
-            })),
-        ));
+        // порог: классический вид — цена предмета, «шансы» — средняя сумма точки за рейд
+        col = match self.view() {
+            LootView::Classic => col
+                .child(section_with_links("sec-price", "Дороже", open_price, Self::toggle_section("price", cx), div(), div()))
+                .when(open_price, |c| {
+                    c.child(div().flex().flex_wrap().gap_1().children(THRESHOLDS.iter().map(|&t| {
+                        segmented(
+                            ElementId::named_usize("thr", t as usize),
+                            if t == 0 { "весь лут".to_string() } else { fmt_short(t) },
+                            self.threshold == t,
+                            cx.listener(move |this, _, _, cx| {
+                                this.threshold = t;
+                                cx.notify();
+                            }),
+                        )
+                    })))
+                }),
+            LootView::Chances => col
+                .child(section_with_links("sec-price", "Средняя сумма точки", open_price, Self::toggle_section("price", cx), div(), div()))
+                .when(open_price, |c| {
+                    c.child(div().flex().flex_wrap().gap_1().children(EV_THRESHOLDS.iter().map(|&t| {
+                        segmented(
+                            ElementId::named_usize("thr", t as usize),
+                            if t == 0 { "все точки".to_string() } else { format!("от {}", fmt_short(t)) },
+                            self.min_ev == t,
+                            cx.listener(move |this, _, _, cx| {
+                                this.min_ev = t;
+                                this.selected_point = None;
+                                cx.notify();
+                            }),
+                        )
+                    })))
+                    .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(match self.loot_source {
+                        LootSource::Tarkov => format!(
+                            "Шанс × цена по отмеченным предметам, за рейд. Точки tarkov.dev, шансы — {}; ≈ — шанса в SPT нет, взято среднее по точке",
+                            data::SPT_DATE
+                        ),
+                        LootSource::Spt => format!("Шанс × цена по отмеченным предметам, за рейд. Точки и шансы — {}", data::SPT_DATE),
+                    }))
+                }),
+        };
 
         let Some(d) = self.data.clone() else {
             return col;
         };
 
         // ---- ДОСТУП: где лежит лут (без ключа / за какой дверью) ----
+        // в «шансах» суммы средние за рейд — помечаем «~»
+        let tilde = if self.view() == LootView::Chances { "~" } else { "" };
         let mut access: HashMap<Option<String>, (usize, i64)> = HashMap::new();
+        let shown_ids = Self::ids_where(&d, |i| self.is_shown(i));
         for (pi, p) in d.loot.iter().enumerate() {
-            let shown: Vec<&Item> = p.items.iter().filter_map(|id| d.items.get(id)).filter(|i| self.is_shown(i)).collect();
-            if shown.is_empty() {
+            let Some(ev) = self.point_pass(&d, p, &shown_ids) else {
                 continue;
-            }
+            };
             let e = access.entry(self.access_of(&d, pi)).or_default();
             e.0 += 1;
-            e.1 += shown.iter().map(|i| i.price()).sum::<i64>();
+            e.1 += ev;
         }
         // все ключи комнат, даже если сейчас там ничего нет
         for room in &d.rooms {
@@ -1639,8 +2069,11 @@ impl HelperApp {
                     .py_1()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(CARD)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.hidden_access.remove(&k2) {
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        if ev.modifiers().alt {
+                            // Alt+клик — оставить только этот доступ
+                            this.hidden_access = all_access_clone(&this.data, &k2);
+                        } else if !this.hidden_access.remove(&k2) {
                             this.hidden_access.insert(k2.clone());
                         }
                         cx.notify();
@@ -1678,33 +2111,35 @@ impl HelperApp {
                             .text_sm()
                             .text_color(rgb(MUTED))
                             .child(match key_price {
-                                Some(kp) => format!("{n} · {} · ключ {}", fmt_short(sum), fmt_short(kp)),
-                                None => format!("{n} · {}", fmt_short(sum)),
+                                Some(kp) => format!("{n} · {tilde}{} · ключ {}", fmt_short(sum), fmt_short(kp)),
+                                None => format!("{n} · {tilde}{}", fmt_short(sum)),
                             }),
                     ),
             );
         }
 
         // ---- ЛУТ: категории, раскрываются до предметов ----
-        // точки на предмет (с учётом фильтра доступа)
-        let mut per_item: HashMap<&str, usize> = HashMap::new();
+        // на предмет: число точек и сколько штук в среднем за рейд — по точкам, прошедшим доступ
+        // и порог (порог считаем по поиску, без галочек категорий, чтобы список не прыгал)
+        let base_ids = Self::ids_where(&d, |i| self.matches_base(i));
+        let mut per_item: HashMap<&str, (usize, f32)> = HashMap::new();
         for (pi, p) in d.loot.iter().enumerate() {
             if self.access_hidden(&d, pi) {
                 continue;
             }
-            let mut seen = HashSet::new();
-            for id in &p.items {
-                if seen.insert(id.as_str()) {
-                    *per_item.entry(id.as_str()).or_default() += 1;
-                }
+            if self.point_pass(&d, p, &base_ids).is_none() {
+                continue;
+            }
+            for (id, c) in p.items.iter().filter(|(id, _)| base_ids.contains(id.as_str())) {
+                let e = per_item.entry(id.as_str()).or_default();
+                e.0 += 1;
+                e.1 += c;
             }
         }
-        let mut by_group: Vec<Vec<(&Item, usize)>> = vec![Vec::new(); GROUPS.len()];
-        for (id, n) in per_item {
+        let mut by_group: Vec<Vec<(&Item, usize, f32)>> = vec![Vec::new(); GROUPS.len()];
+        for (id, (n, per_raid)) in per_item {
             if let Some(it) = d.items.get(id) {
-                if self.matches_base(it) {
-                    by_group[it.group].push((it, n));
-                }
+                by_group[it.group].push((it, n, per_raid));
             }
         }
         for list in &mut by_group {
@@ -1727,16 +2162,20 @@ impl HelperApp {
                 cx.notify();
             })),
         ));
+        if open_loot {
+            col = col.child(div().mb_1().text_xs().text_color(rgb(MUTED)).child("Alt+клик — оставить только это (категорию, предмет, доступ, контейнер)"));
+        }
         if total == 0 && open_loot {
             col = col.child(div().text_sm().text_color(rgb(MUTED)).child("Ничего не найдено"));
         }
-        for (gi, list) in by_group.into_iter().enumerate().filter(|_| open_loot) {
+        for gi in crate::categories::menu_order().filter(|_| open_loot) {
+            let list = std::mem::take(&mut by_group[gi]);
             if list.is_empty() {
                 continue;
             }
             let g = &GROUPS[gi];
             let group_on = !self.hidden_groups.contains(&gi);
-            let n_on = list.iter().filter(|(i, _)| !self.hidden_items.contains(&i.id)).count();
+            let n_on = list.iter().filter(|(i, _, _)| !self.hidden_items.contains(&i.id)).count();
             let state = if !group_on || n_on == 0 {
                 Check::Off
             } else if n_on == list.len() {
@@ -1744,10 +2183,11 @@ impl HelperApp {
             } else {
                 Check::Partial
             };
-            let points: usize = list.iter().filter(|(i, _)| group_on && !self.hidden_items.contains(&i.id)).map(|(_, n)| n).sum();
+            let points: usize = list.iter().filter(|(i, _, _)| group_on && !self.hidden_items.contains(&i.id)).map(|(_, n, _)| n).sum();
             let open = self.expanded.contains(&gi);
-            let ids: Vec<String> = list.iter().map(|(i, _)| i.id.clone()).collect();
+            let ids: Vec<String> = list.iter().map(|(i, _, _)| i.id.clone()).collect();
             let on = state != Check::Off;
+            let n_groups = GROUPS.len();
             col = col.child(
                 div()
                     .id(ElementId::named_usize("grp", gi))
@@ -1767,8 +2207,14 @@ impl HelperApp {
                     .child(
                         div()
                             .id(ElementId::named_usize("grp-check", gi))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if state == Check::Off {
+                            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                                if ev.modifiers().alt {
+                                    // Alt+клик — только эта категория, целиком
+                                    this.hidden_groups = (0..n_groups).filter(|g| *g != gi).collect();
+                                    for id in &ids {
+                                        this.hidden_items.remove(id);
+                                    }
+                                } else if state == Check::Off {
                                     this.hidden_groups.remove(&gi);
                                     for id in &ids {
                                         this.hidden_items.remove(id);
@@ -1794,8 +2240,11 @@ impl HelperApp {
             if !open {
                 continue;
             }
-            let group_ids: Vec<String> = list.iter().map(|(i, _)| i.id.clone()).collect();
-            for (item, n) in list {
+            let group_ids: Vec<String> = list.iter().map(|(i, _, _)| i.id.clone()).collect();
+            // длинные категории («Прочее» — сотни предметов) показываем порциями
+            let limit = self.group_limit.get(&gi).copied().unwrap_or(GROUP_PAGE);
+            let rest = list.len().saturating_sub(limit);
+            for (item, n, per_raid) in list.into_iter().take(limit) {
                 let item_on = group_on && !self.hidden_items.contains(&item.id);
                 let id = item.id.clone();
                 let others = group_ids.clone();
@@ -1809,8 +2258,15 @@ impl HelperApp {
                         .py_1()
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(CARD)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.hidden_groups.contains(&gi) {
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                            if ev.modifiers().alt {
+                                // Alt+клик — только этот предмет на всей карте
+                                this.hidden_groups = (0..n_groups).filter(|g| *g != gi).collect();
+                                for o in &others {
+                                    this.hidden_items.insert(o.clone());
+                                }
+                                this.hidden_items.remove(&id);
+                            } else if this.hidden_groups.contains(&gi) {
                                 // группа была выключена: включаем только этот предмет
                                 this.hidden_groups.remove(&gi);
                                 this.hidden_items.extend(others.iter().filter(|o| **o != id).cloned());
@@ -1824,6 +2280,8 @@ impl HelperApp {
                         .child(
                             div()
                                 .flex_1()
+                                // длинное имя переносится, а не выталкивает цену
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .child(
@@ -1832,12 +2290,84 @@ impl HelperApp {
                                         .when(!item_on, |el| el.line_through())
                                         .child(item.short.clone()),
                                 )
-                                .child(div().text_xs().text_color(rgb(MUTED)).child(format!("{} · {} · {} точ.", item.name, item.price_source(), n))),
+                                .child(div().text_xs().text_color(rgb(MUTED)).child(match self.view() {
+                                    LootView::Classic => format!("{} · {} · {} точ.", item.name, item.price_source(), n),
+                                    LootView::Chances => format!(
+                                        "{} · {} · {} точ. · {} за рейд",
+                                        item.name,
+                                        item.price_source(),
+                                        n,
+                                        fmt_per_raid(per_raid)
+                                    ),
+                                })),
                         )
                         .child(div().text_color(rgb(if item_on { tier_color(item.price()) } else { MUTED })).child(fmt_short(item.price()))),
                 );
             }
+            if rest > 0 {
+                col = col.child(
+                    div()
+                        .id(ElementId::named_usize("grp-more", gi))
+                        .pl(px(34.0))
+                        .py_1()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(GOLD)))
+                        .child(format!("показать ещё {} из {rest}", rest.min(GROUP_PAGE)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            *this.group_limit.entry(gi).or_insert(GROUP_PAGE) += GROUP_PAGE;
+                            cx.notify();
+                        })),
+                );
+            }
         }
+
+        // ---- КОНТЕЙНЕРЫ: только позиции, содержимое tarkov.dev не публикует ----
+        let open_cont = !self.collapsed.contains("cont");
+        let mut per_kind = vec![0usize; d.container_kinds.len()];
+        for c in &d.containers {
+            if d.rooms.is_empty() || !self.hidden_access.contains(&c.room.map(|r| d.rooms[r].key.clone())) {
+                per_kind[c.kind] += 1;
+            }
+        }
+        let n_shown = d.container_kinds.iter().filter(|k| self.shown_containers.contains(&k.id)).count();
+        let all_kinds: Vec<String> = d.container_kinds.iter().map(|k| k.id.clone()).collect();
+        col = col.child(section_with_links(
+            "sec-cont",
+            &format!("Контейнеры · {n_shown} / {}", d.container_kinds.len()),
+            open_cont,
+            Self::toggle_section("cont", cx),
+            link("cont-all", "все", cx.listener(move |this, _, _, cx| {
+                this.shown_containers.extend(all_kinds.iter().cloned());
+                cx.notify();
+            })),
+            link("cont-none", "ничего", cx.listener(|this, _, _, cx| {
+                this.shown_containers.clear();
+                cx.notify();
+            })),
+        ));
+        col = col.when(open_cont, |col| {
+            col.child(div().flex().flex_wrap().gap_x_2().children(d.container_kinds.iter().enumerate().map(|(ki, k)| {
+                let id = k.id.clone();
+                Self::category_cell(
+                    ElementId::named_usize("cont-kind", ki),
+                    k.icon,
+                    &k.name,
+                    per_kind[ki],
+                    self.shown_containers.contains(&k.id),
+                    cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        if ev.modifiers().alt {
+                            // Alt+клик — только этот тип
+                            this.shown_containers = HashSet::from([id.clone()]);
+                        } else if !this.shown_containers.remove(&id) {
+                            this.shown_containers.insert(id.clone());
+                        }
+                        cx.notify();
+                    }),
+                )
+            })))
+        });
 
         // ---- ЛОКАЦИИ ----
         col = col.child(section_with_links(
@@ -2311,7 +2841,7 @@ impl HelperApp {
                             .mt_2()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("Оверлей после рейда висит всегда — пока не подтвердишь или не отменишь."),
+                            .child("Оверлей после рейда висит, пока не подтвердишь, не отменишь или не кликнешь мимо."),
                     )
                     .child(div().text_sm().mt_3().mb_1().child("Где показывать"))
                     .child(div().flex().flex_wrap().gap_1().children(positions.into_iter().enumerate().map(|(i, (v, label))| {
@@ -2851,6 +3381,83 @@ impl HelperApp {
                                 this.auto_update_check = !this.auto_update_check;
                                 cx.notify();
                             }))),
+                    )
+                    // --- карта лута ---
+                    .child(heading("КАРТА ЛУТА"))
+                    .child(
+                        row(
+                            "Вид",
+                            match self.loot_view {
+                                LootView::Classic => "На маркере — самое ценное на точке, фильтр «Дороже N» по цене предмета".into(),
+                                LootView::Chances => format!(
+                                    "Шанс появления каждого предмета и средняя сумма точки за рейд, фильтр по ней ({}). Пока только Лаборатория",
+                                    data::SPT_DATE
+                                ),
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(segmented(
+                                    "st-view-classic",
+                                    "Самое ценное",
+                                    self.loot_view == LootView::Classic,
+                                    cx.listener(|this, _, _, cx| this.set_loot_view(LootView::Classic, this.loot_source, cx)),
+                                ))
+                                .child(segmented(
+                                    "st-view-chances",
+                                    "Шансы",
+                                    self.loot_view == LootView::Chances,
+                                    cx.listener(|this, _, _, cx| this.set_loot_view(LootView::Chances, this.loot_source, cx)),
+                                )),
+                        ),
+                    )
+                    .child(
+                        row(
+                            "Точки лута в виде «Шансы»",
+                            match self.loot_source {
+                                LootSource::Tarkov => {
+                                    "Точки tarkov.dev, шанс предмета из SPT; где его нет — среднее по точке (≈)".into()
+                                }
+                                LootSource::Spt => "Точки и шансы целиком из SPT: мест втрое больше, но бывает мусор".into(),
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .gap_1()
+                                .when(self.loot_view == LootView::Classic, |el| el.opacity(0.5))
+                                .child(segmented(
+                                    "st-src-tarkov",
+                                    "tarkov.dev",
+                                    self.loot_source == LootSource::Tarkov,
+                                    cx.listener(|this, _, _, cx| this.set_loot_view(this.loot_view, LootSource::Tarkov, cx)),
+                                ))
+                                .child(segmented(
+                                    "st-src-spt",
+                                    "SPT",
+                                    self.loot_source == LootSource::Spt,
+                                    cx.listener(|this, _, _, cx| this.set_loot_view(this.loot_view, LootSource::Spt, cx)),
+                                )),
+                        ),
+                    )
+                    .child(
+                        row("Размер иконок", "Все маркеры на карте и в заданиях".into()).child(
+                            div().flex().flex_none().gap_1().children(settings::ICON_SIZES.iter().map(|&size| {
+                                segmented(
+                                    ElementId::named_usize("st-icons", size as usize),
+                                    format!("{size}%"),
+                                    self.icon_size == size,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.icon_size = size;
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                        ),
                     )
                     // --- данные ---
                     .child(heading("ДАННЫЕ И ЦЕНЫ"))
